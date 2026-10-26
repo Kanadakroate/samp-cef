@@ -50,6 +50,10 @@ impl Browser {
         }
     }
 
+    pub fn identifier(&self) -> i32 {
+        self.inner.get_identifier.map(|get| unsafe { get(self.inner.get_mut()) }).unwrap_or(-1)
+    }
+
     pub fn host(&self) -> BrowserHost {
         if let Some(get_host) = self.inner.get_host {
             let host = unsafe { get_host(self.inner.get_mut()) };
@@ -271,6 +275,11 @@ impl Frame {
         let ctx = unsafe { get_ctx(self.inner.get_mut()) };
 
         V8Context::from_raw(ctx)
+    }
+
+    pub fn url(&self) -> String {
+        self.inner.get_url.map(|get| unsafe { get(self.inner.get_mut()) })
+            .filter(|ptr| !ptr.is_null()).map(|ptr| CefString::from(ptr).to_string()).unwrap_or_default()
     }
 
     pub fn load_url(&self, url: &str) {

@@ -1,0 +1,4001 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -255,6 +255,7 @@
+  "cef-server-core",
+  "cxx",
+  "cxx-build",
++ "encoding_rs",
+  "tracing",
+  "tracing-subscriber",
+ ]
+@@ -272,8 +273,11 @@
+ name = "cef-server"
+ version = "0.1.0"
+ dependencies = [
++ "cef-messages",
+  "cef-server-core",
++ "quick-protobuf",
+  "samp",
++ "serde_json",
+  "tracing",
+  "tracing-subscriber",
+ ]
+@@ -285,6 +289,7 @@
+  "cef-messages",
+  "cef-network",
+  "crossbeam-channel",
++ "getrandom 0.2.17",
+  "quick-protobuf",
+  "tracing",
+ ]
+diff --git a/cef/src/browser.rs b/cef/src/browser.rs
+--- a/cef/src/browser.rs
++++ b/cef/src/browser.rs
+@@ -48,6 +48,10 @@
+         Browser {
+             inner: RefGuard::from_raw_add_ref(raw),
+         }
++    }
++
++    pub fn identifier(&self) -> i32 {
++        self.inner.get_identifier.map(|get| unsafe { get(self.inner.get_mut()) }).unwrap_or(-1)
+     }
+ 
+     pub fn host(&self) -> BrowserHost {
+@@ -273,6 +277,11 @@
+         V8Context::from_raw(ctx)
+     }
+ 
++    pub fn url(&self) -> String {
++        self.inner.get_url.map(|get| unsafe { get(self.inner.get_mut()) })
++            .filter(|ptr| !ptr.is_null()).map(|ptr| CefString::from(ptr).to_string()).unwrap_or_default()
++    }
++
+     pub fn load_url(&self, url: &str) {
+         let url = CefString::new(url);
+         let load = self.inner.load_url.unwrap();
+diff --git a/cef/src/handlers/load.rs b/cef/src/handlers/load.rs
+--- a/cef/src/handlers/load.rs
++++ b/cef/src/handlers/load.rs
+@@ -1,6 +1,8 @@
+ use crate::browser::{Browser, Frame};
+ 
+ pub trait LoadHandler {
++    fn on_load_error(&self, _browser: Browser, _frame: Frame, _error_code: i32) {}
++
+     fn on_load_end(&self, _browser: Browser, _frame: Frame, _status_code: i32) {}
+ 
+     fn on_loading_state_change(
+diff --git a/cef/src/lib.rs b/cef/src/lib.rs
+--- a/cef/src/lib.rs
++++ b/cef/src/lib.rs
+@@ -5,6 +5,7 @@
+ pub mod client;
+ pub mod command_line;
+ pub mod handlers;
++pub mod local_policy;
+ pub mod process_message;
+ pub mod ref_counted;
+ pub mod scheme;
+diff --git a/cef/src/local_policy.rs b/cef/src/local_policy.rs
+new file mode 100644
+--- /dev/null
++++ b/cef/src/local_policy.rs
+@@ -0,0 +1,26 @@
++//! LR's native URL boundary. This module has no CEF dependency so the exact
++//! predicate used by browser and renderer can be tested without launching GTA.
++pub fn allows_asset_url(url: &str) -> bool {
++    url.starts_with("sampcef://assets/") && !url.bytes().any(|byte| byte.is_ascii_control())
++}
++
++pub fn allows_bridge(is_main: bool, url: &str) -> bool {
++    is_main && allows_asset_url(url)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn bridge_only_for_local_main_frame() {
++        assert!(allows_bridge(true, "sampcef://assets/lr/index.html?x=1#x"));
++        assert!(!allows_bridge(false, "sampcef://assets/lr/index.html"));
++        for url in ["https://assets/", "http://localhost/", "file:///C:/assets/index.html",
++            "javascript:alert(1)", "data:text/html,test", "about:blank",
++            "sampcef://assets.evil/index.html", "sampcef://assets@evil/index.html",
++            "sampcef://evil@assets/index.html", "sampcef://assets:80/index.html",
++            "sampcef://assets/index.html\n"] {
++            assert!(!allows_bridge(true, url), "accepted {url}");
++        }
++    }
++}
+diff --git a/cef/src/rust_to_c/client.rs b/cef/src/rust_to_c/client.rs
+--- a/cef/src/rust_to_c/client.rs
++++ b/cef/src/rust_to_c/client.rs
+@@ -124,8 +124,51 @@
+ // request
+ 
+ extern "system" fn request(_this: *mut cef_client_t) -> *mut cef_request_handler_t {
+-    println!("request");
+-    null_mut()
++    let mut object: cef_request_handler_t = unsafe { std::mem::zeroed() };
++    object.on_before_browse = Some(local_before_browse);
++    object.on_open_urlfrom_tab = Some(block_open_url);
++    object.get_resource_request_handler = Some(local_resources);
++    Box::into_raw(Box::new(Wrapper::new(object, ()))) as *mut _
++}
++
++fn local_url(request: *mut cef_sys::cef_request_t) -> bool {
++    if request.is_null() { return false; }
++    let url = unsafe { (*request).get_url.map(|get| get(request)) };
++    let Some(url) = url else { return false; };
++    let url = crate::types::string::CefString::from(url).to_string();
++    crate::local_policy::allows_asset_url(&url)
++}
++
++extern "system" fn local_before_browse(
++    _: *mut cef_request_handler_t, _: *mut cef_browser_t, frame: *mut cef_frame_t,
++    request: *mut cef_sys::cef_request_t, _: i32, _: i32,
++) -> i32 {
++    // LR has no subframes, popups or external navigation. A rejected URL never
++    // receives a privileged renderer context, even via redirects or links.
++    let main = !frame.is_null() && unsafe { (*frame).is_main.map(|f| f(frame) == 1).unwrap_or(false) };
++    if main && local_url(request) { 0 } else { 1 }
++}
++
++extern "system" fn block_open_url(
++    _: *mut cef_request_handler_t, _: *mut cef_browser_t, _: *mut cef_frame_t,
++    _: *const cef_sys::cef_string_t, _: cef_sys::cef_window_open_disposition_t::Type, _: i32,
++) -> i32 { 1 }
++
++extern "system" fn local_resources(
++    _: *mut cef_request_handler_t, _: *mut cef_browser_t, _: *mut cef_frame_t,
++    _: *mut cef_sys::cef_request_t, _: i32, _: i32, _: *const cef_sys::cef_string_t, _: *mut i32,
++) -> *mut cef_sys::cef_resource_request_handler_t {
++    let mut object: cef_sys::cef_resource_request_handler_t = unsafe { std::mem::zeroed() };
++    object.on_before_resource_load = Some(local_before_resource);
++    Box::into_raw(Box::new(Wrapper::new(object, ()))) as *mut _
++}
++
++extern "system" fn local_before_resource(
++    _: *mut cef_sys::cef_resource_request_handler_t, _: *mut cef_browser_t,
++    _: *mut cef_frame_t, request: *mut cef_sys::cef_request_t, _: *mut cef_sys::cef_callback_t,
++) -> cef_sys::cef_return_value_t::Type {
++    if local_url(request) { cef_sys::cef_return_value_t::RV_CONTINUE }
++    else { cef_sys::cef_return_value_t::RV_CANCEL }
+ }
+ 
+ extern "system" fn permission<I: Client>(this: *mut cef_client_t) -> *mut cef_permission_handler_t {
+diff --git a/cef/src/rust_to_c/lifespan_handler.rs b/cef/src/rust_to_c/lifespan_handler.rs
+--- a/cef/src/rust_to_c/lifespan_handler.rs
++++ b/cef/src/rust_to_c/lifespan_handler.rs
+@@ -24,8 +24,18 @@
+     obj.interface.on_before_close(browser);
+ }
+ 
++extern "system" fn block_popup(
++    _: *mut cef_life_span_handler_t, _: *mut cef_browser_t, _: *mut cef_sys::cef_frame_t,
++    _: i32, _: *const cef_sys::cef_string_t, _: *const cef_sys::cef_string_t,
++    _: cef_sys::cef_window_open_disposition_t::Type, _: i32,
++    _: *const cef_sys::cef_popup_features_t, _: *mut cef_sys::cef_window_info_t,
++    _: *mut *mut cef_sys::cef_client_t, _: *mut cef_sys::cef_browser_settings_t,
++    _: *mut *mut cef_sys::cef_dictionary_value_t, _: *mut i32,
++) -> i32 { 1 }
++
+ pub fn wrap<T: LifespanHandler>(lifespan: T) -> *mut cef_life_span_handler_t {
+     let mut object: cef_life_span_handler_t = unsafe { std::mem::zeroed() };
++    object.on_before_popup = Some(block_popup);
+     object.on_before_close = Some(on_before_close::<T>);
+     object.on_after_created = Some(on_after_created::<T>);
+ 
+diff --git a/cef/src/rust_to_c/load_handler.rs b/cef/src/rust_to_c/load_handler.rs
+--- a/cef/src/rust_to_c/load_handler.rs
++++ b/cef/src/rust_to_c/load_handler.rs
+@@ -33,11 +33,22 @@
+     obj.interface.on_load_end(browser, frame, status_code);
+ }
+ 
++unsafe extern "system" fn on_load_error<I: LoadHandler>(
++    this: *mut cef_load_handler_t, browser: *mut cef_browser_t, frame: *mut cef_frame_t,
++    error_code: cef_sys::cef_errorcode_t::Type, _: *const cef_sys::cef_string_t,
++    _: *const cef_sys::cef_string_t,
++) {
++    if browser.is_null() || frame.is_null() { return; }
++    let obj: &mut Wrapper<_, I> = Wrapper::unwrap(this);
++    obj.interface.on_load_error(Browser::from_raw_add_ref(browser), Frame::from_raw_add_ref(frame), error_code);
++}
++
+ pub fn wrap<T: LoadHandler>(load: T) -> *mut cef_load_handler_t {
+     let mut object: cef_load_handler_t = unsafe { std::mem::zeroed() };
+ 
+     object.on_loading_state_change = Some(on_loading_state_change::<T>);
+     object.on_load_end = Some(on_load_end::<T>);
++    object.on_load_error = Some(on_load_error::<T>);
+ 
+     let wrapper = Wrapper::new(object, load);
+ 
+diff --git a/client/src/app.rs b/client/src/app.rs
+--- a/client/src/app.rs
++++ b/client/src/app.rs
+@@ -25,7 +25,7 @@
+ 
+ use client_api::wndproc;
+ 
+-use crossbeam_channel::{Receiver, Sender};
++use crossbeam_channel::Receiver;
+ 
+ use retour::GenericDetour;
+ 
+@@ -39,6 +39,7 @@
+ 
+ pub enum Event {
+     Connect(SocketAddr),
++    BindGameConnection(String),
+     Timeout,
+     NetworkError,
+     NetworkJoined,
+@@ -46,6 +47,7 @@
+ 
+     CreateBrowser {
+         id: u32,
++        generation: u32,
+         url: String,
+         hidden: bool,
+         focused: bool,
+@@ -56,9 +58,11 @@
+     DestroyBrowser(u32),
+     HideBrowser(u32, bool),
+     FocusBrowser(u32, bool),
+-    EmitEvent(String, List),
+-    EmitEventOnServer(String, String),
+-    BrowserCreated(u32, i32),
++    RendererFocusBrowser(u32, u32, bool),
++    RendererHideBrowser(u32, u32, bool),
++    EmitEvent(u32, u32, String, List),
++    EmitEventOnServer(u32, u32, String, String),
++    BrowserCreated(u32, u32, i32),
+     AppendToObject(u32, i32),
+     RemoveFromObject(u32, i32),
+     ToggleDevTools(u32, bool),
+@@ -94,7 +98,6 @@
+     network: Option<NetworkClient>,
+     callbacks: CallbackList,
+     keystate_hook: GenericDetour<extern "stdcall" fn(i32) -> u16>,
+-    event_tx: Sender<Event>,
+     event_rx: Receiver<Event>,
+ 
+     //
+@@ -130,7 +133,7 @@
+ impl App {
+     #[allow(clippy::arc_with_non_send_sync)]
+     pub fn new() -> App {
+-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
++        let (event_tx, event_rx) = crossbeam_channel::bounded(1024);
+ 
+         let audio = Audio::new();
+ 
+@@ -162,7 +165,6 @@
+             initialization: Instant::now(),
+             manager,
+             keystate_hook,
+-            event_tx,
+             event_rx,
+             callbacks,
+             audio,
+@@ -205,6 +207,7 @@
+     }
+ 
+     pub fn connect(&mut self) {
++        if !crate::game_command::supported_game() { return; }
+         if self.network.is_some() {
+             return;
+         }
+@@ -231,7 +234,7 @@
+                 "queuing CEF server connection"
+             );
+ 
+-            let network = NetworkClient::new(self.event_tx.clone());
++            let network = NetworkClient::new();
+             network.send(Event::Connect(addr));
+ 
+             self.network = Some(network);
+@@ -277,16 +280,12 @@
+ }
+ 
+ pub fn initialize() {
+-    let app = App::new();
+-    let manager = app.manager();
+-
+-    crate::render::initialize(manager);
+-
+-    unsafe {
+-        APP.set(app);
+-    }
+-
+-    if client_api::samp::version::is_unknown_version() {
++    if !crate::game_command::wait_for_game_module() {
++        tracing::error!("SA:MP module did not load within the startup timeout");
++        return;
++    }
++    // Reject missing/unsupported modules before constructing APP or hooks.
++    if !crate::game_command::supported_game() {
+         tracing::error!("unsupported SA:MP version detected");
+ 
+         client_api::utils::error_message_box(
+@@ -294,10 +293,13 @@
+             "You have installed an unsupported SA:MP version.\nCurrently supported versions are 0.3.DL R1, 0.3.7 R1, and 0.3.7 R3.",
+         );
+ 
+-        // don't waste time
+-    } else {
+-        tracing::info!("client initialized");
+-    }
++        return;
++    }
++    let app = App::new();
++    let manager = app.manager();
++    crate::render::initialize(manager);
++    unsafe { APP.set(app); }
++    tracing::info!("client initialized");
+ }
+ 
+ pub fn uninitialize() {
+@@ -360,7 +362,11 @@
+             }
+         }
+ 
+-        while let Ok(event) = app.event_rx.try_recv() {
++        // Each network instance owns its receive queue. Dropping it on reconnect
++        // also drops queued callbacks from the previous game/QUIC connection.
++        while let Some(event) = app.network.as_ref().and_then(|net| net.recv())
++            .or_else(|| app.event_rx.try_recv().ok()) {
++
+             match event {
+                 Event::AlwaysListenKeys(browser_id, listen) => {
+                     let manager = app.manager.lock();
+@@ -369,6 +375,7 @@
+ 
+                 Event::CreateBrowser {
+                     id,
++                    generation,
+                     url,
+                     hidden,
+                     focused,
+@@ -383,7 +390,7 @@
+ 
+                     let show_cursor = {
+                         let mut manager = app.manager.lock();
+-                        manager.create_browser(id, app.callbacks.clone(), &url);
++                        manager.create_browser(id, generation, app.callbacks.clone(), &url);
+                         manager.hide_browser(id, hidden);
+                         manager.browser_focus(id, focused);
+ 
+@@ -415,6 +422,19 @@
+                     manager.hide_browser(id, hide);
+                 }
+ 
++                Event::RendererFocusBrowser(id, generation, focus) => {
++                    let show_cursor = {
++                        let mut manager = app.manager.lock();
++                        if !manager.browser_matches(id, generation) { continue; }
++                        manager.browser_focus(id, focus);
++                        manager.is_input_blocked() && !CMenuManager::is_menu_active()
++                    };
++                    client_api::samp::inputs::show_cursor(show_cursor);
++                }
++                Event::RendererHideBrowser(id, generation, hide) => {
++                    let manager = app.manager.lock();
++                    if manager.browser_matches(id, generation) { manager.hide_browser(id, hide); }
++                }
+                 Event::FocusBrowser(id, focus) => {
+                     let show_cursor = {
+                         let mut manager = app.manager.lock();
+@@ -425,23 +445,30 @@
+                     client_api::samp::inputs::show_cursor(show_cursor);
+                 }
+ 
+-                Event::EmitEvent(event, list) => {
++                Event::BindGameConnection(token) => {
++                    // Input::Send dispatches command RPC 50. The default callback
++                    // is chat RPC 101 and must never receive this private token.
++                    crate::game_command::send_binding(&token);
++                }
++                Event::EmitEvent(id, generation, event, list) => {
+                     let manager = app.manager.lock();
+-                    manager.trigger_event(&event, list);
+-                }
+-
+-                Event::EmitEventOnServer(event, arguments) => {
++                    manager.trigger_browser_event(id, generation, &event, list);
++                }
++
++                Event::EmitEventOnServer(id, generation, event, arguments) => {
++                    if app.manager.lock().browser_matches(id, generation) {
++                        if let Some(network) = app.network.as_mut() {
++                            network.send(Event::EmitEventOnServer(id, generation, event, arguments));
++                        }
++                    }
++                }
++
++                Event::BrowserCreated(id, generation, code) => {
++                    if !app.manager.lock().browser_matches(id, generation) { continue; }
++                    tracing::info!(browser = id, status = code, "browser created");
++
+                     if let Some(network) = app.network.as_mut() {
+-                        let event = Event::EmitEventOnServer(event, arguments);
+-                        network.send(event);
+-                    }
+-                }
+-
+-                Event::BrowserCreated(id, code) => {
+-                    tracing::info!(browser = id, status = code, "browser created");
+-
+-                    if let Some(network) = app.network.as_mut() {
+-                        let event = Event::BrowserCreated(id, code);
++                        let event = Event::BrowserCreated(id, generation, code);
+                         network.send(event);
+                     }
+ 
+@@ -622,19 +649,9 @@
+                 } else if msg == WM_CHAR || msg == WM_SYSCHAR {
+                     event.type_ = cef_key_event_type_t::KEYEVENT_CHAR;
+ 
+-                    // GTA:SA creates an ANSI window, so WM_CHAR values in the byte range use the
+-                    // active Windows-1251 code page. Preserve that behavior while also accepting
+-                    // UTF-16 values produced by Unicode input methods.
+-                    let character = if wparam <= u8::MAX as usize {
+-                        let bytes = [wparam as u8];
+-                        encoding_rs::WINDOWS_1251
+-                            .decode(&bytes)
+-                            .0
+-                            .encode_utf16()
+-                            .next()
+-                    } else {
+-                        u16::try_from(wparam).ok()
+-                    };
++                    // LR uses Windows-1252 for the GTA ANSI window. Values above
++                    // the byte range retain the existing UTF-16 input behavior.
++                    let character = crate::text_encoding::window_character(wparam);
+ 
+                     if let Some(character) = character {
+                         event.windows_key_code = character as i32;
+diff --git a/client/src/browser.rs b/client/src/browser.rs
+--- a/client/src/browser.rs
++++ b/client/src/browser.rs
+@@ -1,5 +1,8 @@
++mod event_args;
+ pub mod assets_scheme;
+ pub mod cef;
+ pub mod client;
+ pub mod manager;
+ pub mod view;
++
++mod render_order;
+diff --git a/client/src/browser/assets_scheme.rs b/client/src/browser/assets_scheme.rs
+--- a/client/src/browser/assets_scheme.rs
++++ b/client/src/browser/assets_scheme.rs
+@@ -232,7 +232,7 @@
+             });
+     }
+ 
+-    if is_valid_asset_url(value) || has_url_scheme(value) {
++    if is_valid_asset_url(value) {
+         return value.to_string();
+     }
+ 
+diff --git a/client/src/browser/cef.rs b/client/src/browser/cef.rs
+--- a/client/src/browser/cef.rs
++++ b/client/src/browser/cef.rs
+@@ -93,10 +93,8 @@
+         command_line.append_switch("disable-gpu");
+         command_line.append_switch("enable-begin-frame-scheduling");
+         command_line.append_switch_with_value("autoplay-policy", "no-user-gesture-required");
+-        command_line.append_switch("ignore-certificate-errors");
+-
+-        // TODO: permissions
+-        command_line.append_switch("enable-media-stream");
++
++        // The LR bridge uses packaged assets and needs no device permissions.
+     }
+ 
+     #[allow(clippy::not_unsafe_ptr_arg_deref)]
+@@ -179,9 +177,10 @@
+     settings.webgl = cef_sys::cef_state_t::STATE_ENABLED;
+     settings.javascript = cef_sys::cef_state_t::STATE_ENABLED;
+ 
+-    let client = WebClientRef::from(client);
++    let client_ref = WebClientRef::from(client.clone());
+     let result =
+-        cef::browser::BrowserHost::create_browser(&window_info, Some(client), &url, &settings);
++        cef::browser::BrowserHost::create_browser(&window_info, Some(client_ref), &url, &settings);
++    if result == 0 { client.notify_creation_error(-1); }
+ 
+     tracing::debug!(accepted = result, "CEF browser creation submitted");
+ }
+diff --git a/client/src/browser/client.rs b/client/src/browser/client.rs
+--- a/client/src/browser/client.rs
++++ b/client/src/browser/client.rs
+@@ -89,6 +89,7 @@
+ 
+ pub struct WebClient {
+     id: u32, // static
++    generation: u32, // immutable native lifetime, never accepted from JavaScript
+     is_extern: bool,
+     hidden: AtomicBool,
+     prev_hidden_flag: AtomicBool,
+@@ -172,8 +173,13 @@
+     }
+ 
+     fn on_process_message(
+-        &self, _browser: Browser, _frame: Frame, _source: ProcessId, msg: ProcessMessage,
++        &self, _browser: Browser, frame: Frame, source: ProcessId, msg: ProcessMessage,
+     ) -> bool {
++        if !matches!(source, ProcessId::Renderer) || !frame.is_main()
++            || !cef::local_policy::allows_asset_url(&frame.url())
++            || self.0.closing.load(Ordering::SeqCst) {
++            return false;
++        }
+         let name = msg.name().to_string();
+ 
+         tracing::trace!(
+@@ -193,7 +199,7 @@
+                     _ => false,
+                 };
+ 
+-                handle_result(self.0.event_tx.send(Event::FocusBrowser(self.0.id, focus)));
++                handle_result(self.0.event_tx.try_send(Event::RendererFocusBrowser(self.0.id, self.0.generation, focus)));
+ 
+                 return true;
+             }
+@@ -208,7 +214,7 @@
+                     _ => false,
+                 };
+ 
+-                handle_result(self.0.event_tx.send(Event::HideBrowser(self.0.id, hide)));
++                handle_result(self.0.event_tx.try_send(Event::RendererHideBrowser(self.0.id, self.0.generation, hide)));
+ 
+                 return true;
+             }
+@@ -221,6 +227,7 @@
+                 }
+ 
+                 let event_name = args.string(0).to_string();
++                if event_name.is_empty() || event_name.len() > 64 || event_name.contains('\0') { return true; }
+                 let callbacks = self.0.callbacks.lock();
+ 
+                 if let Some(cb) = callbacks.get(&event_name) {
+@@ -233,26 +240,21 @@
+                     }
+                 }
+ 
+-                let mut arguments = String::new();
+-
+-                for idx in 1..args.len() {
+-                    let arg = match args.get_type(idx) {
+-                        ValueType::String => args.string(idx).to_string(),
+-                        ValueType::Bool => (if args.bool(idx) { 1 } else { 0 }).to_string(),
+-                        ValueType::Double => args.double(idx).to_string(),
+-                        ValueType::Integer => args.integer(idx).to_string(),
+-                        _ => "CEF_NULL".to_string(),
+-                    };
+-
+-                    arguments.push_str(&arg);
+-
+-                    if idx != args.len() - 1 {
+-                        arguments.push(' ');
+-                    }
+-                }
+-
+-                let event = Event::EmitEventOnServer(event_name, arguments);
+-                handle_result(self.0.event_tx.send(event));
++                // Preserve a single JSON string byte-for-byte; legacy forms accept
++                // integers only. Arbitrary string concatenation is ambiguous.
++                if self.0.generation == 0 || event_name.len() > 64 || event_name.contains('\0') {
++                    return true;
++                }
++                use super::event_args::{Argument, serialize};
++                if args.len() > 9 { return true; }
++                let values: Vec<_> = (1..args.len()).map(|idx| match args.get_type(idx) {
++                    ValueType::String => Argument::Text(args.string(idx).to_string()),
++                    ValueType::Integer => Argument::Integer(args.integer(idx)),
++                    _ => Argument::Unsupported,
++                }).collect();
++                let Some(arguments) = serialize(&values) else { return true; };
++                let event = Event::EmitEventOnServer(self.0.id, self.0.generation, event_name, arguments);
++                handle_result(self.0.event_tx.try_send(event));
+             }
+ 
+             _ => (),
+@@ -267,20 +269,8 @@
+         &self, _browser: Browser, _prompt_id: u64, requesting_origin: String,
+         requested_permissions: u32,
+     ) -> Option<PermissionRequestResult> {
+-        const LOCAL_NETWORK_PERMISSIONS: u32 =
+-            (cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED
+-                | cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK
+-                | cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK)
+-                as u32;
+-
+-        if requesting_origin.trim_end_matches('/') == "sampcef://assets"
+-            && requested_permissions != 0
+-            && requested_permissions & !LOCAL_NETWORK_PERMISSIONS == 0
+-        {
+-            Some(PermissionRequestResult::Accept)
+-        } else {
+-            None
+-        }
++        let _ = (requesting_origin, requested_permissions);
++        Some(PermissionRequestResult::Deny)
+     }
+ }
+ 
+@@ -394,6 +384,10 @@
+ }
+ 
+ impl LoadHandler for WebClientRef {
++    fn on_load_error(&self, _browser: Browser, frame: Frame, error_code: i32) {
++        if frame.is_main() { self.0.notify_creation_error(error_code); }
++    }
++
+     fn on_load_end(&self, _browser: Browser, frame: Frame, status_code: i32) {
+         tracing::trace!(
+             browser = self.0.id,
+@@ -401,9 +395,9 @@
+             "browser load completed"
+         );
+ 
+-        if frame.is_main() {
+-            let event = Event::BrowserCreated(self.0.id, status_code);
+-            handle_result(self.0.event_tx.send(event));
++        if frame.is_main() && cef::local_policy::allows_asset_url(&frame.url()) && !self.0.closing.load(Ordering::SeqCst) {
++            let event = Event::BrowserCreated(self.0.id, self.0.generation, status_code);
++            handle_result(self.0.event_tx.try_send(event));
+         }
+     }
+ }
+@@ -462,9 +456,15 @@
+ }
+ 
+ impl WebClient {
++    pub fn notify_creation_error(&self, error_code: i32) {
++        if self.generation != 0 && !self.closing.load(Ordering::SeqCst) {
++            let _ = self.event_tx.try_send(Event::BrowserCreated(self.id, self.generation, error_code.min(-1)));
++        }
++    }
++
+     #[allow(clippy::arc_with_non_send_sync)]
+     pub fn new(
+-        id: u32, cbs: CallbackList, event_tx: Sender<Event>, audio: Arc<Audio>,
++        id: u32, generation: u32, cbs: CallbackList, event_tx: Sender<Event>, audio: Arc<Audio>,
+     ) -> Arc<WebClient> {
+         let rect = crate::utils::client_rect();
+ 
+@@ -491,6 +491,7 @@
+             audio,
+             event_tx,
+             id,
++            generation,
+             windowless_frame_rate: AtomicI32::new(0),
+         };
+ 
+@@ -517,6 +518,7 @@
+             audio,
+             event_tx,
+             id,
++            generation: 0,
+             windowless_frame_rate: AtomicI32::new(0),
+         };
+ 
+@@ -739,6 +741,8 @@
+         }
+     }
+ 
++    pub fn generation(&self) -> u32 { self.generation }
++
+     pub fn id(&self) -> u32 {
+         self.id
+     }
+diff --git a/client/src/browser/event_args.rs b/client/src/browser/event_args.rs
+new file mode 100644
+--- /dev/null
++++ b/client/src/browser/event_args.rs
+@@ -0,0 +1,30 @@
++//! Exact wire shape for native renderer events; no JS-supplied identity fields.
++pub enum Argument { Text(String), Integer(i32), Unsupported }
++pub fn serialize(args: &[Argument]) -> Option<String> {
++    let text = match args {
++        [] => String::new(),
++        [Argument::Text(text)] => text.clone(),
++        _ if args.len() <= 8 && args.iter().all(|a| matches!(a, Argument::Integer(_))) => {
++            args.iter().map(|a| match a { Argument::Integer(n) => n.to_string(), _ => unreachable!() }).collect::<Vec<_>>().join(" ")
++        }
++        _ => return None,
++    };
++    (text.len() <= 4096 && !text.contains('\0')).then_some(text)
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn zero_argument_ready_and_abort_preserve_empty_payload() {
++        for _event in ["lr:test:ready", "lr:test:abort"] { assert_eq!(serialize(&[]), Some(String::new())); }
++    }
++    #[test] fn one_json_string_is_exact_and_legacy_integers_are_unambiguous() {
++        let json = r#"{"x":"quoted \\"text\\" and \\u00fc"}"#;
++        assert_eq!(serialize(&[Argument::Text(json.into())]), Some(json.into()));
++        assert_eq!(serialize(&[Argument::Integer(-1), Argument::Integer(2147483647)]).as_deref(), Some("-1 2147483647"));
++        assert!(serialize(&[Argument::Text("a".into()), Argument::Text("b".into())]).is_none());
++        assert!(serialize(&[Argument::Unsupported]).is_none());
++        assert!(serialize(&[Argument::Text("x".repeat(4097))]).is_none());
++        assert!(serialize(&[Argument::Text("a\0b".into())]).is_none());
++        assert!(serialize(&(0..9).map(Argument::Integer).collect::<Vec<_>>()).is_none());
++    }
++}
+diff --git a/client/src/browser/manager.rs b/client/src/browser/manager.rs
+--- a/client/src/browser/manager.rs
++++ b/client/src/browser/manager.rs
+@@ -150,11 +150,11 @@
+         }
+     }
+ 
+-    pub fn create_browser(&mut self, id: u32, cbs: CallbackList, url: &str) {
++    pub fn create_browser(&mut self, id: u32, generation: u32, cbs: CallbackList, url: &str) {
+         let render_mode = crate::utils::current_render_mode();
+         tracing::trace!(browser = id, url, ?render_mode, "creating overlay browser");
+ 
+-        let client = WebClient::new(id, cbs, self.event_tx.clone(), self.audio.clone());
++        let client = WebClient::new(id, generation, cbs, self.event_tx.clone(), self.audio.clone());
+ 
+         crate::browser::cef::create_browser(client.clone(), url);
+         self.append_client(id, client);
+@@ -288,31 +288,10 @@
+             return;
+         }
+ 
+-        if let Some(&focus) = self.focused.as_ref() {
+-            for client in self
+-                .clients
+-                .values()
+-                .filter(|client| client.id() != focus && !client.is_extern() && !client.is_hidden())
+-            {
+-                client.draw();
+-            }
+-
+-            if let Some(focused) = self
+-                .clients
+-                .get(&focus)
+-                .filter(|client| !client.is_extern() && !client.is_hidden())
+-            {
+-                focused.draw();
+-            }
+-        } else {
+-            for client in self
+-                .clients
+-                .values()
+-                .filter(|client| !client.is_extern() && !client.is_hidden())
+-            {
+-                client.draw();
+-            }
+-        }
++        let mut visible = self.clients.values()
++            .filter(|client| !client.is_extern() && !client.is_hidden()).collect::<Vec<_>>();
++        visible.sort_unstable_by_key(|client| super::render_order::key(client.id(), self.focused));
++        for client in visible { client.draw(); }
+     }
+ 
+     #[inline]
+@@ -475,8 +454,25 @@
+         }
+     }
+ 
++    pub fn browser_matches(&self, id: u32, generation: u32) -> bool {
++        generation != 0 && self.clients.get(&id).is_some_and(|client| client.generation() == generation)
++    }
++
++    pub fn trigger_browser_event(&self, id: u32, generation: u32, event_name: &str, list: List) {
++        if !self.browser_matches(id, generation) { return; }
++        let client = &self.clients[&id];
++        if let Some(frame) = client.browser().map(|browser| browser.main_frame()) {
++            if !cef::local_policy::allows_asset_url(&frame.url()) { return; }
++            let msg = cef::process_message::ProcessMessage::create("trigger_event");
++            msg.argument_list().set_string(0, &CefString::new(event_name));
++            msg.argument_list().set_list(1, list);
++            frame.send_process_message(cef::ProcessId::Renderer, msg);
++        }
++    }
++
+     pub fn trigger_event(&self, event_name: &str, list: List) {
+-        for client in self.clients.values() {
++        // The legacy local plugin API cannot broadcast into server-owned browsers.
++        for client in self.clients.values().filter(|client| client.generation() == 0) {
+             if let Some(frame) = client.browser().map(|browser| browser.main_frame()) {
+                 let name = CefString::new(event_name);
+                 let msg = cef::process_message::ProcessMessage::create("trigger_event");
+diff --git a/client/src/browser/render_order.rs b/client/src/browser/render_order.rs
+new file mode 100644
+--- /dev/null
++++ b/client/src/browser/render_order.rs
+@@ -0,0 +1,18 @@
++/// Native browser IDs are stable; HashMap insertion order must not choose
++/// overlay stacking. Keyboard focus preserves upstream's final draw position.
++pub fn key(id: u32, focused: Option<u32>) -> (bool, u32) {
++    (focused == Some(id), id)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn browser_ids_order_stably_and_focus_stays_last() {
++        let mut ids = vec![2400, 1200, 900, 1300];
++        ids.sort_unstable_by_key(|id| key(*id, None));
++        assert_eq!(ids, vec![900, 1200, 1300, 2400]);
++        ids.sort_unstable_by_key(|id| key(*id, Some(1200)));
++        assert_eq!(ids, vec![900, 1300, 2400, 1200]);
++    }
++}
+diff --git a/client/src/external.rs b/client/src/external.rs
+--- a/client/src/external.rs
++++ b/client/src/external.rs
+@@ -253,6 +253,7 @@
+ 
+         let event = Event::CreateBrowser {
+             id,
++            generation: 0,
+             hidden,
+             focused,
+             url: url_rust.to_string(),
+diff --git a/client/src/game_command.rs b/client/src/game_command.rs
+new file mode 100644
+--- /dev/null
++++ b/client/src/game_command.rs
+@@ -0,0 +1,209 @@
++//! Private game-bind relay through SA:MP Input::Send (server-command RPC 50).
++//! The default command callback is chat RPC 101 and must never receive a token.
++//! RVAs/thiscall ABI are verified against the supported DLLs in the accompanying
++//! command-relay evidence. No chat, editbox or input-history storage is used.
++
++use std::ffi::{c_char, c_void};
++use std::time::Duration;
++
++const MODULE_WAIT_LIMIT: Duration = Duration::from_secs(10);
++const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(50);
++
++fn wait_for_module(
++    mut is_loaded: impl FnMut() -> bool,
++    mut elapsed: impl FnMut() -> Duration,
++    mut sleep: impl FnMut(Duration),
++) -> bool {
++    loop {
++        let elapsed = elapsed();
++        if elapsed > MODULE_WAIT_LIMIT { return false; }
++        if is_loaded() { return true; }
++        let remaining = MODULE_WAIT_LIMIT.saturating_sub(elapsed);
++        if remaining.is_zero() { return false; }
++        sleep(remaining.min(MODULE_POLL_INTERVAL));
++    }
++}
++
++/// The ASI loader already calls initialize from its worker, outside DllMain.
++/// OMP launcher starts GTA before injecting samp.dll, so absence may be brief.
++/// No hooks or version-dependent game pointers are accessed while waiting.
++#[cfg(not(test))]
++pub fn wait_for_game_module() -> bool {
++    let started = std::time::Instant::now();
++    wait_for_module(client_api::samp::is_loaded, || started.elapsed(), std::thread::sleep)
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum GameVersion { Dl, R1, R3, Unsupported }
++
++type SendCommand = unsafe extern "thiscall" fn(*mut c_void, *const c_char);
++
++fn send_rva(version: GameVersion) -> Option<usize> {
++    match version {
++        GameVersion::Dl => Some(0x69340),
++        GameVersion::R1 => Some(0x65C60),
++        GameVersion::R3 => Some(0x69190),
++        GameVersion::Unsupported => None,
++    }
++}
++
++fn send_address(version: GameVersion, module: usize) -> Option<usize> {
++    if module == 0 { return None; }
++    module.checked_add(send_rva(version)?)
++}
++
++fn bind_command(token: &str) -> Option<[u8; 74]> {
++    if token.len() != 64 || !token.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
++        return None;
++    }
++    let mut command = [0u8; 74];
++    command[..9].copy_from_slice(b"/__lrcef ");
++    command[9..73].copy_from_slice(token.as_bytes());
++    Some(command)
++}
++
++fn expected_prologue(bytes: &[u8]) -> bool {
++    // The following SEH addresses are relocated and differ in R3-1. Only this
++    // common, relocation-free prefix is compared; absolute file bytes are not.
++    bytes == [0x64, 0xa1, 0, 0, 0, 0, 0x6a, 0xff, 0x68]
++}
++
++unsafe fn invoke(input: *mut c_void, send: SendCommand, command: &[u8; 74]) -> bool {
++    if input.is_null() { return false; }
++    unsafe { send(input, command.as_ptr().cast()); }
++    true
++}
++
++#[cfg(not(test))]
++fn loaded_version() -> Option<GameVersion> {
++    use client_api::samp::version::{version, Version};
++    if !client_api::samp::is_loaded() { return None; }
++    Some(match version() {
++        Version::V03DL => GameVersion::Dl,
++        Version::V037 => GameVersion::R1,
++        Version::V037R3 => GameVersion::R3,
++        _ => GameVersion::Unsupported,
++    })
++}
++
++#[cfg(not(test))]
++pub fn supported_game() -> bool { loaded_version().and_then(send_rva).is_some() }
++
++#[cfg(not(test))]
++fn executable_send(module: usize, address: usize) -> bool {
++    use winapi::um::memoryapi::VirtualQuery;
++    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
++        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD};
++    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++    let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
++    if unsafe { VirtualQuery(address as *const winapi::ctypes::c_void, &mut info, size) } != size {
++        return false;
++    }
++    let readable_code = PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    let Some(end) = address.checked_add(9) else { return false; };
++    let Some(region_end) = (info.BaseAddress as usize).checked_add(info.RegionSize) else { return false; };
++    if info.State != MEM_COMMIT || info.AllocationBase as usize != module
++        || info.Protect & PAGE_GUARD != 0 || info.Protect & readable_code == 0 || end > region_end {
++        return false;
++    }
++    expected_prologue(unsafe { std::slice::from_raw_parts(address as *const u8, 9) })
++}
++
++/// Called only on the existing game thread after pinned QUIC delivers a token.
++#[cfg(not(test))]
++pub fn send_binding(token: &str) -> bool {
++    let Some(command) = bind_command(token) else { return false; };
++    let Some(version) = loaded_version() else { return false; };
++    let module = client_api::samp::handle() as usize;
++    let Some(address) = send_address(version, module) else { return false; };
++    if !executable_send(module, address) { return false; }
++    let Some(input) = client_api::samp::inputs::Input::get() else { return false; };
++    let input = (input as *mut client_api::samp::inputs::Input).cast::<c_void>();
++    let send: SendCommand = unsafe { std::mem::transmute(address) };
++    unsafe { invoke(input, send, &command) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::Cell;
++
++    #[test]
++    fn loaded_module_does_not_delay_startup() {
++        let sleeps = Cell::new(0);
++        assert!(wait_for_module(|| true, || Duration::ZERO, |_| sleeps.set(sleeps.get() + 1)));
++        assert_eq!(sleeps.get(), 0);
++    }
++
++    #[test]
++    fn delayed_module_is_observed_before_initialization() {
++        let clock = Cell::new(Duration::ZERO);
++        let sleeps = Cell::new(0);
++        assert!(wait_for_module(|| clock.get() >= Duration::from_millis(125), || clock.get(), |d| {
++            clock.set(clock.get() + d);
++            sleeps.set(sleeps.get() + 1);
++        }));
++        assert_eq!(clock.get(), Duration::from_millis(150));
++        assert_eq!(sleeps.get(), 3);
++    }
++
++    #[test]
++    fn missing_module_times_out_and_late_load_is_not_accepted() {
++        let clock = Cell::new(Duration::ZERO);
++        let polls = Cell::new(0);
++        assert!(!wait_for_module(|| { polls.set(polls.get() + 1); false }, || clock.get(), |d| {
++            assert!(d <= MODULE_POLL_INTERVAL);
++            clock.set(clock.get() + d);
++        }));
++        assert_eq!(clock.get(), MODULE_WAIT_LIMIT);
++        assert_eq!(polls.get(), 201);
++        assert!(!wait_for_module(|| true, || MODULE_WAIT_LIMIT + Duration::from_millis(1), |_| panic!("past deadline")));
++    }
++
++    #[test]
++    fn only_exact_private_command_can_be_built() {
++        let token = "0123456789abcdef".repeat(4);
++        let command = bind_command(&token).unwrap();
++        assert_eq!(&command[..9], b"/__lrcef ");
++        assert_eq!(&command[9..73], token.as_bytes());
++        assert_eq!(command[73], 0);
++        for bad in ["".into(), "a".repeat(63), "a".repeat(65), "A".repeat(64),
++            "g".repeat(64), "\0".repeat(64), " ".repeat(64), "é".repeat(32)] {
++            assert!(bind_command(&bad).is_none());
++        }
++    }
++
++    #[test]
++    fn routes_only_verified_versions_and_loaded_modules() {
++        assert_eq!(send_address(GameVersion::Dl, 0x10000000), Some(0x10069340));
++        assert_eq!(send_address(GameVersion::R1, 0x10000000), Some(0x10065c60));
++        assert_eq!(send_address(GameVersion::R3, 0x10000000), Some(0x10069190));
++        assert_eq!(send_address(GameVersion::Unsupported, 0x10000000), None);
++        assert_eq!(send_address(GameVersion::Dl, 0), None);
++        assert_eq!(send_address(GameVersion::Dl, usize::MAX), None);
++        assert!(expected_prologue(&[0x64, 0xa1, 0, 0, 0, 0, 0x6a, 0xff, 0x68]));
++        assert!(!expected_prologue(&[0xe9, 0, 0, 0, 0, 0, 0, 0, 0]));
++    }
++
++    // This naked Win32 stub observes the real call ABI: ECX is Input*, the
++    // sole stack argument is the C string, and callee removes exactly 4 bytes.
++    #[unsafe(naked)]
++    unsafe extern "thiscall" fn observe_abi(_: *mut c_void, _: *const c_char) {
++        std::arch::naked_asm!("mov eax, [esp + 4]", "mov [ecx], eax", "ret 4");
++    }
++
++    #[test]
++    fn real_i686_thiscall_uses_ecx_and_one_stack_argument_without_buffer_changes() {
++        #[repr(C)]
++        struct Receiver { argument: *const c_char, untouched: [u8; 1024] }
++        let command = bind_command(&"abcdef0123456789".repeat(4)).unwrap();
++        let mut receiver = Receiver { argument: std::ptr::null(), untouched: [0x5a; 1024] };
++        for _ in 0..10_000 {
++            assert!(unsafe { invoke((&mut receiver as *mut Receiver).cast(), observe_abi, &command) });
++            assert_eq!(receiver.argument, command.as_ptr().cast());
++            assert_eq!(receiver.untouched, [0x5a; 1024]);
++        }
++        assert!(!unsafe { invoke(std::ptr::null_mut(), observe_abi, &command) });
++        assert_eq!(std::ffi::CStr::from_bytes_with_nul(&command).unwrap().to_bytes(), &command[..73]);
++    }
++}
+diff --git a/client/src/lib.rs b/client/src/lib.rs
+--- a/client/src/lib.rs
++++ b/client/src/lib.rs
+@@ -24,6 +24,8 @@
+ pub mod render;
+ pub mod static_cell;
+ pub mod utils;
++mod text_encoding;
++mod game_command;
+ 
+ // TODO: Сделать человеческие модули звука
+ 
+diff --git a/client/src/network.rs b/client/src/network.rs
+--- a/client/src/network.rs
++++ b/client/src/network.rs
+@@ -24,10 +24,12 @@
+ 
+ pub struct NetworkClient {
+     event_tx: Sender<Event>,
++    incoming_rx: Receiver<Event>,
+ }
+ 
+ impl NetworkClient {
+-    pub fn new(net_tx: Sender<Event>) -> NetworkClient {
++    pub fn new() -> NetworkClient {
++        let (net_tx, incoming_rx) = crossbeam_channel::unbounded();
+         let (client_tx, client_rx) = crossbeam_channel::unbounded();
+ 
+         std::thread::spawn(move || {
+@@ -42,8 +44,11 @@
+ 
+         NetworkClient {
+             event_tx: client_tx,
+-        }
+-    }
++            incoming_rx,
++        }
++    }
++
++    pub fn recv(&self) -> Option<Event> { self.incoming_rx.try_recv().ok() }
+ 
+     pub fn send(&self, message: Event) {
+         handle_result(self.event_tx.send(message));
+@@ -64,14 +69,6 @@
+ }
+ 
+ impl ConnectionState {
+-    fn addr(&self) -> Option<SocketAddr> {
+-        match self {
+-            ConnectionState::Auth(addr, _, _) => Some(*addr),
+-            ConnectionState::Connected(addr, _) => Some(*addr),
+-            _ => None,
+-        }
+-    }
+-
+     fn peer(&self) -> Option<PeerId> {
+         match self {
+             ConnectionState::Auth(_, _, peer) => Some(*peer),
+@@ -112,15 +109,17 @@
+     fn handle_packet(&mut self, packet: packets::Packet) {
+         use packets::PacketId::*;
+ 
++        if !matches!(self.connection_state, ConnectionState::Connected(..))
++            && !matches!(packet.packet_id, OPEN_CONNECTION | JOIN_RESPONSE) { return; }
+         match packet.packet_id {
+             OPEN_CONNECTION => {
+-                if let ConnectionState::Auth(_, _, peer) = &self.connection_state {
+-                    self.net_connect(*peer);
+-                } else {
+-                    tracing::trace!(
+-                        state = ?self.connection_state,
+-                        "unexpected open-connection response"
+-                    );
++                if self.connection_state.is_auth() {
++                    if let Ok(open) = deserialize_from_slice::<packets::OpenConnection>(&packet.bytes) {
++                        let token = open.bind_token.to_string();
++                        if token.len() == 64 && token.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
++                            handle_result(self.event_tx.send(Event::BindGameConnection(token)));
++                        }
++                    }
+                 }
+             }
+ 
+@@ -229,6 +228,7 @@
+     fn handle_create_browser(&mut self, packet: packets::CreateBrowser) {
+         let event = Event::CreateBrowser {
+             id: packet.browser_id,
++            generation: packet.browser_generation,
+             url: packet.url.to_string(),
+             hidden: packet.hidden,
+             focused: packet.focused,
+@@ -242,6 +242,8 @@
+     }
+ 
+     fn handle_emit_event(&mut self, packet: packets::EmitEvent) {
++        let (Some(id), Some(generation)) = (packet.browser_id, packet.browser_generation) else { return; };
++        if generation == 0 { return; }
+         let list = cef::types::list::List::new();
+ 
+         for (idx, arg) in packet.arguments.iter().enumerate() {
+@@ -261,7 +263,7 @@
+ 
+         handle_result(
+             self.event_tx
+-                .send(Event::EmitEvent(packet.event_name.to_string(), list)),
++                .send(Event::EmitEvent(id, generation, packet.event_name.to_string(), list)),
+         );
+     }
+ 
+@@ -325,6 +327,7 @@
+     }
+ 
+     fn net_open_connection(&mut self, address: SocketAddr) {
++        if let Some(peer) = self.connection_state.peer() { self.socket.disconnect(peer); }
+         let peer = self.socket.connect(address);
+         self.connection_state = ConnectionState::Auth(address, Instant::now(), peer);
+ 
+@@ -335,24 +338,11 @@
+         );
+     }
+ 
+-    fn net_connect(&mut self, peer: PeerId) {
+-        let auth = packets::RequestJoin {
+-            plugin_version: crate::app::CEF_PLUGIN_VERSION,
+-        };
+-
+-        let Ok(packet) = messages::try_into_packet(auth) else {
+-            tracing::error!(packet = "request_join", "cannot serialize network packet");
+-            return;
+-        };
+-
+-        tracing::trace!(?peer, "sending join request");
+-
+-        self.socket.send_message(peer, packet);
+-    }
+-
+-    fn net_emit_event(&mut self, event: String, args: String) {
++    fn net_emit_event(&mut self, browser_id: u32, browser_generation: u32, event: String, args: String) {
+         if let ConnectionState::Connected(_address, peer) = self.connection_state {
+             let emit = packets::EmitEvent {
++                browser_id: Some(browser_id),
++                browser_generation: Some(browser_generation),
+                 event_name: event.into(),
+                 args: Some(args.into()),
+                 arguments: Vec::new(),
+@@ -367,10 +357,11 @@
+         }
+     }
+ 
+-    fn net_browser_created(&mut self, browser_id: u32, status_code: i32) {
++    fn net_browser_created(&mut self, browser_id: u32, browser_generation: u32, status_code: i32) {
+         if let ConnectionState::Connected(_address, peer) = self.connection_state {
+             let created = packets::BrowserCreated {
+                 browser_id,
++                browser_generation,
+                 status_code,
+             };
+ 
+@@ -399,44 +390,34 @@
+                         }
+                     }
+ 
+-                    SocketEvent::Disconnect(peer, _addr) => {
++                    SocketEvent::Disconnect(peer, _) | SocketEvent::ConnectionError(peer) => {
+                         if peer == server_peer {
+-                            tracing::debug!(?peer, "CEF server disconnected");
++                            self.connection_state = ConnectionState::Disconnected;
+                             handle_result(self.event_tx.send(Event::Timeout));
+-
+-                            if !self.connection_state.is_auth() {
+-                                self.net_open_connection(self.connection_state.addr().unwrap());
+-                            }
++                            break;
+                         }
+                     }
+ 
+-                    SocketEvent::ConnectionError(error) => {
+-                        tracing::warn!(?error, "CEF connection failed");
+-                        handle_result(self.event_tx.send(Event::Timeout));
+-
+-                        if !self.connection_state.is_auth() {
+-                            self.net_open_connection(self.connection_state.addr().unwrap());
+-                        }
+-                    }
+-
+                     _ => (),
+                 }
+             }
+         }
+ 
+         if let ConnectionState::Auth(addr, time, _) = &self.connection_state
+-            && time.elapsed() >= Duration::from_millis(2500)
++            && time.elapsed() >= Duration::from_secs(15)
+         {
+-            tracing::debug!(server = %addr, "retrying CEF server connection");
+-            self.net_open_connection(*addr);
++            let _ = addr;
++            if let Some(peer) = self.connection_state.peer() { self.socket.disconnect(peer); }
++            self.connection_state = ConnectionState::Disconnected;
++            handle_result(self.event_tx.send(Event::Timeout));
+         }
+     }
+ 
+     fn process_event(&mut self, event: Event) {
+         match event {
+             Event::Connect(addr) => self.net_open_connection(addr),
+-            Event::EmitEventOnServer(event, arguments) => self.net_emit_event(event, arguments),
+-            Event::BrowserCreated(id, code) => self.net_browser_created(id, code),
++            Event::EmitEventOnServer(id, generation, event, arguments) => self.net_emit_event(id, generation, event, arguments),
++            Event::BrowserCreated(id, generation, code) => self.net_browser_created(id, generation, code),
+             _ => (),
+         }
+     }
+diff --git a/client/src/text_encoding.rs b/client/src/text_encoding.rs
+new file mode 100644
+--- /dev/null
++++ b/client/src/text_encoding.rs
+@@ -0,0 +1,22 @@
++//! LR's GTA ANSI window uses Windows-1252. Larger WM_CHAR values are UTF-16.
++pub fn window_character(wparam: usize) -> Option<u16> {
++    if wparam <= u8::MAX as usize {
++        let bytes = [wparam as u8];
++        encoding_rs::WINDOWS_1252.decode(&bytes).0.encode_utf16().next()
++    } else {
++        u16::try_from(wparam).ok()
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn german_ansi_input_and_utf16_are_preserved() {
++        for (byte, scalar) in [(0xe4, 0x00e4), (0xf6, 0x00f6), (0xfc, 0x00fc), (0xdf, 0x00df), (0x80, 0x20ac)] {
++            assert_eq!(window_character(byte), Some(scalar));
++        }
++        assert_eq!(window_character(b'A' as usize), Some(0x41));
++        assert_eq!(window_character(0x20ac), Some(0x20ac));
++        assert_eq!(window_character(0xd83d), Some(0xd83d));
++        assert_eq!(window_character(0x10000), None);
++    }
++}
+diff --git a/messages/src/lib.rs b/messages/src/lib.rs
+--- a/messages/src/lib.rs
++++ b/messages/src/lib.rs
+@@ -26,3 +26,18 @@
+ {
+     T::try_into(value).and_then(|packet| serialize_into_vec(&packet))
+ }
++
++#[cfg(test)]
++mod lr_tests {
++    use super::*;
++    use quick_protobuf::{serialize_into_vec, deserialize_from_slice};
++    #[test] fn scoped_wire_round_trip_preserves_generation_and_exact_json() {
++        let event = packets::EmitEvent { event_name: "lr:house:ready".into(), args: Some(r#"{"text":"a b\\c\\u00e4"}"#.into()), arguments: Vec::new(), browser_id: Some(54), browser_generation: Some(23) };
++        let bytes = serialize_into_vec(&event).unwrap();
++        let decoded: packets::EmitEvent = deserialize_from_slice(&bytes).unwrap();
++        assert_eq!(decoded, event);
++        let open = packets::OpenConnection { bind_token: "abcdef0123456789".repeat(4).into() };
++        let bytes = serialize_into_vec(&open).unwrap();
++        let decoded: packets::OpenConnection = deserialize_from_slice(&bytes).unwrap(); assert_eq!(decoded, open);
++    }
++}
+diff --git a/messages/src/packets.rs b/messages/src/packets.rs
+--- a/messages/src/packets.rs
++++ b/messages/src/packets.rs
+@@ -11,7 +11,7 @@
+ impl_into_packet!(AlwaysListenKeys, PacketId::ALWAYS_LISTEN_KEYS);
+ impl_into_packet!(BrowserCreated, PacketId::BROWSER_CREATED);
+ impl_into_packet!(Got, PacketId::GOT);
+-impl_into_packet!(OpenConnection, PacketId::OPEN_CONNECTION);
++impl_into_packet!(OpenConnection<'a>, PacketId::OPEN_CONNECTION);
+ impl_into_packet!(CreateExternalBrowser<'a>, PacketId::CREATE_EXTERNAL_BROWSER);
+ impl_into_packet!(AppendToObject, PacketId::APPEND_TO_OBJECT);
+ impl_into_packet!(RemoveFromObject, PacketId::REMOVE_FROM_OBJECT);
+diff --git a/messages/src/proto/packets.rs b/messages/src/proto/packets.rs
+--- a/messages/src/proto/packets.rs
++++ b/messages/src/proto/packets.rs
+@@ -198,6 +198,7 @@
+     pub url: Cow<'a, str>,
+     pub hidden: bool,
+     pub focused: bool,
++    pub browser_generation: u32,
+ }
+ 
+ impl<'a> MessageRead<'a> for CreateBrowser<'a> {
+@@ -209,6 +210,7 @@
+                 Ok(18) => msg.url = r.read_string(bytes).map(Cow::Borrowed)?,
+                 Ok(24) => msg.hidden = r.read_bool(bytes)?,
+                 Ok(32) => msg.focused = r.read_bool(bytes)?,
++                Ok(40) => msg.browser_generation = r.read_uint32(bytes)?,
+                 Ok(t) => { r.read_unknown(bytes, t)?; }
+                 Err(e) => return Err(e),
+             }
+@@ -220,6 +222,7 @@
+ impl<'a> MessageWrite for CreateBrowser<'a> {
+     fn get_size(&self) -> usize {
+         0
++        + 1 + sizeof_varint(self.browser_generation as u64)
+         + 1 + sizeof_varint(*(&self.browser_id) as u64)
+         + 1 + sizeof_len((&self.url).len())
+         + 1 + sizeof_varint(*(&self.hidden) as u64)
+@@ -231,6 +234,7 @@
+         w.write_with_tag(18, |w| w.write_string(&**&self.url))?;
+         w.write_with_tag(24, |w| w.write_bool(*&self.hidden))?;
+         w.write_with_tag(32, |w| w.write_bool(*&self.focused))?;
++        w.write_with_tag(40, |w| w.write_uint32(self.browser_generation))?;
+         Ok(())
+     }
+ }
+@@ -306,6 +310,8 @@
+     pub event_name: Cow<'a, str>,
+     pub args: Option<Cow<'a, str>>,
+     pub arguments: Vec<EventValue<'a>>,
++    pub browser_id: Option<u32>,
++    pub browser_generation: Option<u32>,
+ }
+ 
+ impl<'a> MessageRead<'a> for EmitEvent<'a> {
+@@ -316,6 +322,8 @@
+                 Ok(10) => msg.event_name = r.read_string(bytes).map(Cow::Borrowed)?,
+                 Ok(18) => msg.args = Some(r.read_string(bytes).map(Cow::Borrowed)?),
+                 Ok(26) => msg.arguments.push(r.read_message::<EventValue>(bytes)?),
++                Ok(32) => msg.browser_id = Some(r.read_uint32(bytes)?),
++                Ok(40) => msg.browser_generation = Some(r.read_uint32(bytes)?),
+                 Ok(t) => { r.read_unknown(bytes, t)?; }
+                 Err(e) => return Err(e),
+             }
+@@ -327,6 +335,8 @@
+ impl<'a> MessageWrite for EmitEvent<'a> {
+     fn get_size(&self) -> usize {
+         0
++        + self.browser_generation.as_ref().map_or(0, |m| 1 + sizeof_varint(*m as u64))
++        + self.browser_id.as_ref().map_or(0, |m| 1 + sizeof_varint(*m as u64))
+         + 1 + sizeof_len((&self.event_name).len())
+         + self.args.as_ref().map_or(0, |m| 1 + sizeof_len((m).len()))
+         + self.arguments.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
+@@ -336,6 +346,8 @@
+         w.write_with_tag(10, |w| w.write_string(&**&self.event_name))?;
+         if let Some(ref s) = self.args { w.write_with_tag(18, |w| w.write_string(&**s))?; }
+         for s in &self.arguments { w.write_with_tag(26, |w| w.write_message(s))?; }
++        if let Some(v) = self.browser_id { w.write_with_tag(32, |w| w.write_uint32(v))?; }
++        if let Some(v) = self.browser_generation { w.write_with_tag(40, |w| w.write_uint32(v))?; }
+         Ok(())
+     }
+ }
+@@ -453,6 +465,7 @@
+ pub struct BrowserCreated {
+     pub browser_id: u32,
+     pub status_code: i32,
++    pub browser_generation: u32,
+ }
+ 
+ impl<'a> MessageRead<'a> for BrowserCreated {
+@@ -462,6 +475,7 @@
+             match r.next_tag(bytes) {
+                 Ok(8) => msg.browser_id = r.read_uint32(bytes)?,
+                 Ok(16) => msg.status_code = r.read_int32(bytes)?,
++                Ok(24) => msg.browser_generation = r.read_uint32(bytes)?,
+                 Ok(t) => { r.read_unknown(bytes, t)?; }
+                 Err(e) => return Err(e),
+             }
+@@ -473,6 +487,7 @@
+ impl MessageWrite for BrowserCreated {
+     fn get_size(&self) -> usize {
+         0
++        + 1 + sizeof_varint(self.browser_generation as u64)
+         + 1 + sizeof_varint(*(&self.browser_id) as u64)
+         + 1 + sizeof_varint(*(&self.status_code) as u64)
+     }
+@@ -480,6 +495,7 @@
+     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
+         w.write_with_tag(8, |w| w.write_uint32(*&self.browser_id))?;
+         w.write_with_tag(16, |w| w.write_int32(*&self.status_code))?;
++        w.write_with_tag(24, |w| w.write_uint32(self.browser_generation))?;
+         Ok(())
+     }
+ }
+@@ -497,16 +513,26 @@
+ impl MessageWrite for Got { }
+ 
+ #[derive(Debug, Default, PartialEq, Clone)]
+-pub struct OpenConnection { }
+-
+-impl<'a> MessageRead<'a> for OpenConnection {
+-    fn from_reader(r: &mut BytesReader, _: &[u8]) -> Result<Self> {
+-        r.read_to_end();
+-        Ok(Self::default())
+-    }
+-}
+-
+-impl MessageWrite for OpenConnection { }
++pub struct OpenConnection<'a> { pub bind_token: Cow<'a, str> }
++impl<'a> MessageRead<'a> for OpenConnection<'a> {
++    fn from_reader(r: &mut BytesReader, bytes: &'a [u8]) -> Result<Self> {
++        let mut msg = Self::default();
++        while !r.is_eof() {
++            match r.next_tag(bytes) {
++                Ok(10) => msg.bind_token = r.read_string(bytes).map(Cow::Borrowed)?,
++                Ok(t) => { r.read_unknown(bytes, t)?; }
++                Err(e) => return Err(e),
++            }
++        }
++        Ok(msg)
++    }
++}
++impl<'a> MessageWrite for OpenConnection<'a> {
++    fn get_size(&self) -> usize { 1 + sizeof_len(self.bind_token.len()) }
++    fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
++        w.write_with_tag(10, |w| w.write_string(&self.bind_token))?; Ok(())
++    }
++}
+ 
+ #[derive(Debug, Default, PartialEq, Clone)]
+ pub struct CreateExternalBrowser<'a> {
+diff --git a/network/src/client.rs b/network/src/client.rs
+--- a/network/src/client.rs
++++ b/network/src/client.rs
+@@ -1,63 +1,155 @@
+ use quinn::crypto::rustls::QuicClientConfig;
+ use quinn::{ClientConfig, Endpoint};
+ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
++use rustls::client::WebPkiServerVerifier;
+ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+-use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
++use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+ use std::sync::Arc;
++use std::ffi::OsStr;
++use std::path::{Path, PathBuf};
+ 
++/// Provisioned release certificate; no fallback. WebPKI still checks validity,
++/// DNS name and actual TLS handshake signatures. Zero-RTT remains disabled.
+ #[derive(Debug)]
+-struct SkipServerVerification;
++struct PinnedServerVerification {
++    certificate: CertificateDer<'static>,
++    verifier: Arc<WebPkiServerVerifier>,
++}
+ 
+-impl SkipServerVerification {
+-    fn new() -> Arc<Self> {
+-        Arc::new(Self)
++impl ServerCertVerifier for PinnedServerVerification {
++    fn verify_server_cert(
++        &self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>],
++        server_name: &ServerName<'_>, ocsp_response: &[u8], now: UnixTime,
++    ) -> Result<ServerCertVerified, RustlsError> {
++        if end_entity.as_ref() != self.certificate.as_ref() {
++            return Err(RustlsError::General("CEF release certificate pin mismatch".into()));
++        }
++        self.verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
++    }
++    fn verify_tls12_signature(
++        &self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, RustlsError> {
++        self.verifier.verify_tls12_signature(message, cert, dss)
++    }
++    fn verify_tls13_signature(
++        &self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, RustlsError> {
++        self.verifier.verify_tls13_signature(message, cert, dss)
++    }
++    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
++        self.verifier.supported_verify_schemes()
+     }
+ }
+ 
+-impl ServerCertVerifier for SkipServerVerification {
+-    fn verify_server_cert(
+-        &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
+-        _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
+-    ) -> Result<ServerCertVerified, RustlsError> {
+-        Ok(ServerCertVerified::assertion())
++fn release_pin_path(
++    override_path: Option<&OsStr>,
++    current_exe: impl FnOnce() -> std::io::Result<PathBuf>,
++) -> anyhow::Result<PathBuf> {
++    if let Some(value) = override_path {
++        let path = PathBuf::from(value);
++        if value.is_empty() || !path.is_absolute() {
++            return Err(anyhow::anyhow!("SAMP_CEF_PIN_CERT must be a nonempty absolute DER certificate path"));
++        }
++        return Ok(path);
+     }
+-
+-    fn verify_tls12_signature(
+-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
+-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+-        Ok(HandshakeSignatureValid::assertion())
++    let executable = current_exe()?;
++    if !executable.is_absolute() {
++        return Err(anyhow::anyhow!("The current executable path must be absolute"));
+     }
+-
+-    fn verify_tls13_signature(
+-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
+-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+-        Ok(HandshakeSignatureValid::assertion())
+-    }
+-
+-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+-        rustls::crypto::ring::default_provider()
+-            .signature_verification_algorithms
+-            .supported_schemes()
+-    }
++    let directory = executable.parent().ok_or_else(|| anyhow::anyhow!("The current executable has no parent directory"))?;
++    Ok(directory.join("cef").join("server.der"))
+ }
+ 
+-pub fn make_insecure_client(bind_addr: std::net::SocketAddr) -> anyhow::Result<Endpoint> {
+-    let client_cfg = configure_insecure_client()?;
++fn pinned_client_config(pin_path: &Path) -> anyhow::Result<ClientConfig> {
++    let certificate = CertificateDer::from(std::fs::read(pin_path)?);
++    let mut roots = RootCertStore::empty();
++    roots.add(certificate.clone())?;
++    let provider = Arc::new(rustls::crypto::ring::default_provider());
++    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()?;
++    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
++        .with_protocol_versions(&[&rustls::version::TLS13])?
++        .dangerous()
++        .with_custom_certificate_verifier(Arc::new(PinnedServerVerification { certificate, verifier }))
++        .with_no_client_auth();
++    tls.enable_early_data = false;
++    Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?)))
++}
++
++pub fn make_pinned_client(bind_addr: std::net::SocketAddr) -> anyhow::Result<Endpoint> {
++    let override_path = std::env::var_os("SAMP_CEF_PIN_CERT");
++    let pin_path = release_pin_path(override_path.as_deref(), std::env::current_exe)?;
++    let config = pinned_client_config(&pin_path)?;
+     let mut endpoint = Endpoint::client(bind_addr)?;
+-    endpoint.set_default_client_config(client_cfg);
++    endpoint.set_default_client_config(config);
+     Ok(endpoint)
+ }
+ 
+-fn configure_insecure_client() -> anyhow::Result<ClientConfig> {
+-    let mut tls_config = rustls::ClientConfig::builder_with_provider(
+-        rustls::crypto::ring::default_provider().into(),
+-    )
+-    .with_protocol_versions(&[&rustls::version::TLS13])?
+-    .dangerous()
+-    .with_custom_certificate_verifier(SkipServerVerification::new())
+-    .with_no_client_auth();
+-    tls_config.enable_early_data = true;
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn verifier(cert: CertificateDer<'static>) -> PinnedServerVerification {
++        let mut roots = RootCertStore::empty();
++        roots.add(cert.clone()).unwrap();
++        let verifier = WebPkiServerVerifier::builder_with_provider(
++            Arc::new(roots), Arc::new(rustls::crypto::ring::default_provider()),
++        ).build().unwrap();
++        PinnedServerVerification { certificate: cert, verifier }
++    }
++    #[test]
++    fn exact_certificate_and_dns_name_required() {
++        let good = rcgen::generate_simple_self_signed(vec!["samp.cef".into()]).unwrap();
++        let good = CertificateDer::from(good.cert);
++        let other = rcgen::generate_simple_self_signed(vec!["samp.cef".into()]).unwrap();
++        let other = CertificateDer::from(other.cert);
++        let verifier = verifier(good.clone());
++        let name = ServerName::try_from("samp.cef").unwrap();
++        assert!(verifier.verify_server_cert(&good, &[], &name, &[], UnixTime::now()).is_ok());
++        assert!(verifier.verify_server_cert(&other, &[], &name, &[], UnixTime::now()).is_err());
++        let wrong_name = ServerName::try_from("attacker.example").unwrap();
++        assert!(verifier.verify_server_cert(&good, &[], &wrong_name, &[], UnixTime::now()).is_err());
++    }
+ 
+-    let crypto = QuicClientConfig::try_from(tls_config)?;
+-    Ok(ClientConfig::new(Arc::new(crypto)))
++    #[test]
++    fn packaged_pin_uses_executable_parent_and_explicit_override_is_absolute() {
++        let root = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
++        let executable = root.join("game").join("gta_sa.exe");
++        assert_eq!(release_pin_path(None, || Ok(executable.clone())).unwrap(),
++            root.join("game").join("cef").join("server.der"));
++        let explicit = root.join("lab").join("pin.der");
++        assert_eq!(release_pin_path(Some(explicit.as_os_str()), || panic!("override must not depend on executable lookup")).unwrap(), explicit);
++        assert!(release_pin_path(None, || Ok(PathBuf::from("relative-game.exe"))).is_err());
++        assert!(release_pin_path(None, || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err());
++        for value in ["", "server.der", "./cef/server.der", "../server.der"] {
++            assert!(release_pin_path(Some(OsStr::new(value)), || panic!("invalid override must not fall back")).is_err());
++        }
++    }
++
++    #[test]
++    fn actual_pin_read_errors_and_invalid_der_fail_closed() {
++        struct Scratch(PathBuf);
++        impl Drop for Scratch {
++            fn drop(&mut self) {
++                for file in ["empty.der", "broken.der", "valid.der"] {
++                    let _ = std::fs::remove_file(self.0.join(file));
++                }
++                let _ = std::fs::remove_dir(&self.0);
++            }
++        }
++        let unique = format!("lr-cef-pin-{}-{}", std::process::id(),
++            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
++        let base = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
++        let scratch = Scratch(base.join(unique));
++        std::fs::create_dir(&scratch.0).unwrap();
++        assert!(pinned_client_config(&scratch.0.join("missing.der")).is_err());
++        assert!(pinned_client_config(&scratch.0).is_err());
++        std::fs::write(scratch.0.join("empty.der"), []).unwrap();
++        std::fs::write(scratch.0.join("broken.der"), b"not a DER certificate").unwrap();
++        assert!(pinned_client_config(&scratch.0.join("empty.der")).is_err());
++        assert!(pinned_client_config(&scratch.0.join("broken.der")).is_err());
++        let cert = rcgen::generate_simple_self_signed(vec!["samp.cef".into()]).unwrap();
++        std::fs::write(scratch.0.join("valid.der"), cert.cert.der()).unwrap();
++        assert!(pinned_client_config(&scratch.0.join("valid.der")).is_ok());
++        let missing_override = release_pin_path(Some(scratch.0.join("missing.der").as_os_str()), || panic!("no fallback")).unwrap();
++        assert!(pinned_client_config(&missing_override).is_err());
++    }
+ }
+diff --git a/network/src/lib.rs b/network/src/lib.rs
+--- a/network/src/lib.rs
++++ b/network/src/lib.rs
+@@ -17,11 +17,10 @@
+     pub struct PeerId;
+ }
+ 
+-const INCOMING_PACKET_SIZE: usize = 10 * 1024 * 1024; // 10Mb
++const INCOMING_PACKET_SIZE: usize = 64 * 1024; // bounded native wire envelope
+ 
+ pub enum CertStrategy {
+-    // LetsEncrypt(String),
+-    SelfSigned,
++    FromFiles,
+ }
+ 
+ pub enum Event {
+@@ -36,7 +35,7 @@
+     Connected(
+         Connection,
+         oneshot::Sender<PeerId>,
+-        Sender<Vec<u8>>,
++        mpsc::Sender<Vec<u8>>,
+         Option<PeerId>,
+     ),
+     Message(PeerId, Vec<u8>),
+@@ -52,7 +51,7 @@
+ 
+ struct ActiveConnection {
+     connection: Connection,
+-    msg_tx: Sender<Vec<u8>>,
++    msg_tx: mpsc::Sender<Vec<u8>>,
+ }
+ 
+ pub struct Socket {
+@@ -68,7 +67,7 @@
+         let runtime = Runtime::new()?;
+         let _guard = runtime.enter();
+ 
+-        let endpoint = client::make_insecure_client(addr)?;
++        let endpoint = client::make_pinned_client(addr)?;
+ 
+         Ok(Self::setup(runtime, endpoint, false))
+     }
+@@ -77,13 +76,13 @@
+         let runtime = Runtime::new()?;
+         let _guard = runtime.enter();
+ 
+-        let endpoint = server::make_self_signed(addr)?;
++        let endpoint = server::make_from_files(addr)?;
+ 
+         Ok(Self::setup(runtime, endpoint, true))
+     }
+ 
+     fn setup(runtime: Runtime, endpoint: Endpoint, is_listening: bool) -> Self {
+-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
++        let (event_tx, event_rx) = crossbeam_channel::bounded(1024);
+         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+ 
+         runtime.spawn(worker_task(endpoint, cmd_rx, event_tx, is_listening));
+@@ -113,7 +112,9 @@
+ 
+     pub fn send_message(&self, peer_id: PeerId, message: Vec<u8>) {
+         if let Some(peer) = self.peers.get(peer_id) {
+-            let _ = peer.msg_tx.send(message);
++            if peer.msg_tx.try_send(message).is_err() {
++                peer.connection.close(0u32.into(), b"outbound queue full");
++            }
+         }
+     }
+ 
+@@ -153,19 +154,6 @@
+         }
+ 
+         None
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn server_socket_starts_without_an_external_async_runtime() {
+-        let address = "127.0.0.1:0".parse().unwrap();
+-        let socket = Socket::new_server(address, CertStrategy::SelfSigned);
+-
+-        assert!(socket.is_ok(), "server socket failed: {:?}", socket.err());
+     }
+ }
+ 
+@@ -194,7 +182,7 @@
+                     ));
+                 }
+                 Err(_) => {
+-                    let _ = event_tx.send(WorkerEvent::ConnectionError(peer_id));
++                    let _ = event_tx.try_send(WorkerEvent::ConnectionError(peer_id));
+                 }
+             },
+ 
+@@ -207,9 +195,12 @@
+ }
+ 
+ async fn accept_connections(endpoint: Endpoint, event_tx: crossbeam_channel::Sender<WorkerEvent>) {
++    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+     while let Some(incoming) = endpoint.accept().await {
++        let Ok(permit) = limit.clone().try_acquire_owned() else { incoming.refuse(); continue; };
+         let event_tx = event_tx.clone();
+         tokio::spawn(async move {
++            let _permit = permit;
+             if let Ok(connecting) = incoming.accept() {
+                 let _ = process_connection(connecting, event_tx, None).await;
+             }
+@@ -225,14 +216,14 @@
+         Ok(conn) => conn,
+         Err(_) => {
+             if let Some(peer_id) = peer_id {
+-                let _ = event_tx.send(WorkerEvent::ConnectionError(peer_id));
++                let _ = event_tx.try_send(WorkerEvent::ConnectionError(peer_id));
+             }
+ 
+             return Ok(());
+         }
+     };
+ 
+-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
++    let (msg_tx, mut msg_rx) = mpsc::channel(128);
+ 
+     let peer_id =
+         notify_about_incoming(event_tx.clone(), connection.clone(), msg_tx, peer_id).await?;
+@@ -251,10 +242,10 @@
+ 
+ async fn notify_about_incoming(
+     event_tx: crossbeam_channel::Sender<WorkerEvent>, connection: Connection,
+-    msg_tx: Sender<Vec<u8>>, peer_id: Option<PeerId>,
++    msg_tx: mpsc::Sender<Vec<u8>>, peer_id: Option<PeerId>,
+ ) -> anyhow::Result<PeerId> {
+     let (tx, rx) = oneshot::channel();
+-    event_tx.send(WorkerEvent::Connected(connection, tx, msg_tx, peer_id))?;
++    event_tx.try_send(WorkerEvent::Connected(connection, tx, msg_tx, peer_id))?;
+ 
+     Ok(rx.await?)
+ }
+@@ -264,11 +255,21 @@
+ ) {
+     while let Ok(mut stream) = connection.accept_uni().await {
+         if let Ok(bytes) = stream.read_to_end(INCOMING_PACKET_SIZE).await
+-            && event_tx.send(WorkerEvent::Message(peer_id, bytes)).is_err()
++            && event_tx.try_send(WorkerEvent::Message(peer_id, bytes)).is_err()
+         {
++            connection.close(0u32.into(), b"event queue full");
+             break;
+         }
+     }
+ 
+-    let _ = event_tx.send(WorkerEvent::Disconnect(peer_id));
+-}
++    // Do not lose lifecycle cleanup when the bounded data queue is saturated.
++    // Yield between retries so runtime shutdown can cancel this task cleanly.
++    let mut event = WorkerEvent::Disconnect(peer_id);
++    loop {
++        match event_tx.try_send(event) {
++            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
++            Err(crossbeam_channel::TrySendError::Full(returned)) => { event = returned; }
++        }
++        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
++    }
++}
+diff --git a/network/src/server.rs b/network/src/server.rs
+--- a/network/src/server.rs
++++ b/network/src/server.rs
+@@ -3,23 +3,20 @@
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+-pub fn make_self_signed(bind_addr: std::net::SocketAddr) -> anyhow::Result<Endpoint> {
+-    let cert = rcgen::generate_simple_self_signed(vec!["samp.cef".into()])?;
+-    let cert_der = CertificateDer::from(cert.cert);
+-    let priv_key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+-
+-    let server_config = configure_server(cert_der, priv_key)?;
+-    Ok(Endpoint::server(server_config, bind_addr)?)
++pub fn make_from_files(bind_addr: std::net::SocketAddr) -> anyhow::Result<Endpoint> {
++    let cert_path = std::env::var_os("SAMP_CEF_SERVER_CERT")
++        .ok_or_else(|| anyhow::anyhow!("SAMP_CEF_SERVER_CERT must name the persistent DER certificate"))?;
++    let key_path = std::env::var_os("SAMP_CEF_SERVER_KEY")
++        .ok_or_else(|| anyhow::anyhow!("SAMP_CEF_SERVER_KEY must name the local PKCS#8 DER private key"))?;
++    let certificate = CertificateDer::from(std::fs::read(cert_path)?);
++    let private_key = PrivatePkcs8KeyDer::from(std::fs::read(key_path)?);
++    let mut transport = TransportConfig::default();
++    transport.keep_alive_interval(Some(Duration::from_secs(1)));
++    transport.max_concurrent_uni_streams(16u32.into());
++    transport.max_concurrent_bidi_streams(0u32.into());
++    transport.stream_receive_window((64 * 1024u32).into());
++    transport.receive_window((256 * 1024u32).into());
++    let mut config = ServerConfig::with_single_cert(vec![certificate], private_key.into())?;
++    config.transport = Arc::new(transport);
++    Ok(Endpoint::server(config, bind_addr)?)
+ }
+-
+-fn configure_server(
+-    cert: CertificateDer<'static>, priv_key: PrivatePkcs8KeyDer<'static>,
+-) -> anyhow::Result<ServerConfig> {
+-    let mut transport_config = TransportConfig::default();
+-    transport_config.keep_alive_interval(Some(Duration::from_secs(1)));
+-
+-    let mut server_config = ServerConfig::with_single_cert(vec![cert], priv_key.into())?;
+-    server_config.transport = Arc::new(transport_config);
+-
+-    Ok(server_config)
+-}
+diff --git a/openmp-component/Cargo.toml b/openmp-component/Cargo.toml
+--- a/openmp-component/Cargo.toml
++++ b/openmp-component/Cargo.toml
+@@ -10,6 +10,7 @@
+ crate-type = ["staticlib"]
+ 
+ [dependencies]
++encoding_rs = "=0.8.35"
+ cxx = "1.0"
+ server-core = { path = "../server-core", package = "cef-server-core" }
+ tracing = "0.1.44"
+diff --git a/openmp-component/component/CMakeLists.txt b/openmp-component/component/CMakeLists.txt
+--- a/openmp-component/component/CMakeLists.txt
++++ b/openmp-component/component/CMakeLists.txt
+@@ -14,6 +14,9 @@
+ endif()
+ set(SAMP_CEF_ENABLE_GRPC_EXT "OFF" CACHE STRING "Enable openmp-ext gRPC integration: AUTO, ON, or OFF")
+ set_property(CACHE SAMP_CEF_ENABLE_GRPC_EXT PROPERTY STRINGS AUTO ON OFF)
++if(NOT SAMP_CEF_ENABLE_GRPC_EXT STREQUAL "OFF")
++	message(FATAL_ERROR "LR protocol 1 requires SAMP_CEF_ENABLE_GRPC_EXT=OFF; the optional gRPC API has not been qualified for scoped callbacks")
++endif()
+ set(OPEN_MP_SERVER_ROOT "$ENV{OPEN_MP_SERVER_ROOT}" CACHE PATH "Optional open.mp server root used by the install target")
+ set(SAMP_CEF_INSTALL_COMPONENT_DIR "" CACHE PATH "Directory where open.mp component binaries are installed")
+ set(SAMP_CEF_INSTALL_COMPONENT_NAME "cef-openmp" CACHE STRING "CMake install component used for CEF open.mp artifacts")
+@@ -35,6 +38,7 @@
+ set(GENERATED_CXXBRIDGE_HEADER "${GENERATED_INCLUDE_DIR}/cef-openmp/src/lib.rs.h")
+ 
+ set(CARGO_BUILD_ARGS build --release --manifest-path "${RUST_MANIFEST}")
++list(APPEND CARGO_BUILD_ARGS --locked)
+ if(SAMP_CEF_RUST_TARGET)
+ 	list(APPEND CARGO_BUILD_ARGS --target "${SAMP_CEF_RUST_TARGET}")
+ 	set(RUST_LIB_DIR "${SAMP_CEF_CARGO_TARGET_DIR}/${SAMP_CEF_RUST_TARGET}/release")
+@@ -48,6 +52,11 @@
+ 	set(RUST_STATIC_LIB "${RUST_LIB_DIR}/libcef_openmp.a")
+ endif()
+ 
++file(GLOB_RECURSE SAMP_CEF_SERVER_RUST_INPUTS CONFIGURE_DEPENDS
++	"${SAMP_CEF_ROOT}/server-core/src/*.rs"
++	"${SAMP_CEF_ROOT}/network/src/*.rs"
++	"${SAMP_CEF_ROOT}/messages/src/*.rs"
++)
+ add_custom_command(
+ 	OUTPUT
+ 		"${RUST_STATIC_LIB}"
+@@ -71,6 +80,10 @@
+ 		"${SAMP_CEF_ROOT}/server-core/src/lib.rs"
+ 		"${SAMP_CEF_ROOT}/server-core/src/server.rs"
+ 		"${SAMP_CEF_ROOT}/server-core/src/client.rs"
++		${SAMP_CEF_SERVER_RUST_INPUTS}
++		"${SAMP_CEF_ROOT}/server-core/Cargo.toml"
++		"${SAMP_CEF_ROOT}/network/Cargo.toml"
++		"${SAMP_CEF_ROOT}/messages/Cargo.toml"
+ 	VERBATIM
+ )
+ 
+@@ -79,6 +92,10 @@
+ add_library(cef SHARED
+ 	src/component.cpp
+ )
++if(MSVC)
++	# Match the Rust workspace's crt-static release library.
++	set_property(TARGET cef PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
++endif()
+ 
+ set(SAMP_CEF_GRPC_EXT_ENABLED FALSE)
+ 
+@@ -94,6 +111,9 @@
+ 	OMP-SDK
+ 	"${RUST_STATIC_LIB}"
+ )
++if(WIN32)
++	target_link_libraries(cef PRIVATE ws2_32 userenv advapi32 ntdll bcrypt crypt32 secur32 ncrypt iphlpapi)
++endif()
+ 
+ target_compile_definitions(cef PRIVATE
+ 	OMP_VERSION_MAJOR=1
+@@ -101,6 +121,7 @@
+ 	OMP_VERSION_PATCH=8
+ 	FLOATPOINT
+ 	PAWN_CELL_SIZE=32
++	HAVE_STDINT_H=1
+ )
+ 
+ string(TOUPPER "${SAMP_CEF_ENABLE_GRPC_EXT}" SAMP_CEF_ENABLE_GRPC_EXT_UPPER)
+diff --git a/openmp-component/component/src/component.cpp b/openmp-component/component/src/component.cpp
+--- a/openmp-component/component/src/component.cpp
++++ b/openmp-component/component/src/component.cpp
+@@ -5,15 +5,18 @@
+ #endif
+ 
+ #if SAMP_CEF_HAS_GRPC_EXT
++#error "LR protocol 1 does not support the unscoped gRPC API"
+ #include <omp_ext/component.hpp>
+ #endif
+ 
+ #include <Server/Components/Pawn/pawn.hpp>
+ #include <amx/amx.h>
+ #include <sdk.hpp>
++#include "pawn_callback_guard.hpp"
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cmath>
+ #include <optional>
+ #include <set>
+ #include <string>
+@@ -383,7 +386,9 @@
+ 			return;
+ 		}
+ 
+-		for (;;)
++		// A network producer must never keep the game main thread in this loop.
++		// Remaining callbacks are handled by the next server tick.
++		for (unsigned int dispatched = 0; dispatched < 32; ++dispatched)
+ 		{
+ 			ServerEvent event = (*server_)->poll_event();
+ 			if (event.kind == EventKind::None)
+@@ -424,8 +429,10 @@
+ 			{ "cef_on_player_disconnect", &CefComponent::nativeOnPlayerDisconnect },
+ 			{ "cef_create_browser", &CefComponent::nativeCreateBrowser },
+ 			{ "cef_destroy_browser", &CefComponent::nativeDestroyBrowser },
+-			{ "cef_emit_event", &CefComponent::nativeEmitEvent },
+-			{ "cef_subscribe", &CefComponent::nativeSubscribe },
++			{ "cef_lr_protocol_version", &CefComponent::nativeProtocolVersion },
++			{ "cef_bind_game_connection", &CefComponent::nativeBindGameConnection },
++			{ "cef_emit_browser_event", &CefComponent::nativeEmitBrowserEvent },
++			{ "cef_subscribe_browser", &CefComponent::nativeSubscribeBrowser },
+ 			{ "cef_always_listen_keys", &CefComponent::nativeAlwaysListenKeys },
+ 			{ "cef_hide_browser", &CefComponent::nativeHideBrowser },
+ 			{ "cef_focus_browser", &CefComponent::nativeFocusBrowser },
+@@ -531,7 +538,7 @@
+ 			break;
+ 
+ 		case EventKind::BrowserCreated:
+-			notifyBrowserCreated(event.player_id, event.browser_id, event.code);
++			notifyBrowserCreated(event.player_id, event.browser_id, event.browser_generation, event.code);
+ 			break;
+ 
+ 		case EventKind::None:
+@@ -543,13 +550,18 @@
+ 	{
+ 		const std::string name = toStdString(event.event);
+ 		auto subscription = subscriptions_.find(name);
+-		const std::string arguments = toStdString(event.arguments);
++		const auto encoded = samp_cef::openmp::utf8_to_pawn(event.arguments);
++		if (encoded.empty() && !event.arguments.empty()) return;
++		const std::string arguments(encoded.begin(), encoded.end());
+ 		if (subscription != subscriptions_.end() && subscription->second.script)
+ 		{
++			PawnCallbackGuard guard(*subscription->second.script);
+ 			subscription->second.script->Call(
+ 				subscription->second.callback.c_str(),
+ 				DefaultReturnValue_False,
+ 				event.player_id,
++				static_cast<int>(event.browser_id),
++				static_cast<int>(event.browser_generation),
+ 				StringView(arguments.data(), arguments.length()));
+ 		}
+ 
+@@ -562,6 +574,7 @@
+ 	{
+ 		for (IPawnScript* script : scripts_)
+ 		{
++			PawnCallbackGuard guard(*script);
+ 			script->Call("OnCefInitialize", DefaultReturnValue_True, playerID, success ? 1 : 0);
+ 		}
+ 
+@@ -573,11 +586,12 @@
+ #endif
+ 	}
+ 
+-	void notifyBrowserCreated(int playerID, std::uint32_t browserID, int code)
++	void notifyBrowserCreated(int playerID, std::uint32_t browserID, std::uint32_t generation, int code)
+ 	{
+ 		for (IPawnScript* script : scripts_)
+ 		{
+-			script->Call("OnCefBrowserCreated", DefaultReturnValue_True, playerID, static_cast<int>(browserID), code);
++			PawnCallbackGuard guard(*script);
++			script->Call("OnCefBrowserCreatedScoped", DefaultReturnValue_True, playerID, static_cast<int>(browserID), static_cast<int>(generation), code);
+ 		}
+ 
+ #if SAMP_CEF_HAS_GRPC_EXT
+@@ -603,7 +617,7 @@
+ 		}
+ 
+ 		int length = 0;
+-		if (script.StrLen(physicalAddress, &length) != AMX_ERR_NONE)
++		if (script.StrLen(physicalAddress, &length) != AMX_ERR_NONE || length < 0 || length > 65536)
+ 		{
+ 			return false;
+ 		}
+@@ -614,7 +628,10 @@
+ 			return false;
+ 		}
+ 
+-		output.assign(buffer.data());
++		// Pawn strings are Windows-1252; never reinterpret arbitrary bytes as Rust UTF-8.
++		const auto utf8 = samp_cef::openmp::pawn_to_utf8(rust::Slice<const std::uint8_t>(
++			reinterpret_cast<const std::uint8_t*>(buffer.data()), static_cast<std::size_t>(length)));
++		output = toStdString(utf8);
+ 		return true;
+ 	}
+ 
+@@ -1329,6 +1346,21 @@
+ 		return instance_;
+ 	}
+ 
++	static cell AMX_NATIVE_CALL nativeProtocolVersion(AMX*, const cell* params)
++	{
++		return pawnParamCount(params) == 0 ? 1 : 0;
++	}
++
++	static cell AMX_NATIVE_CALL nativeBindGameConnection(AMX* amx, const cell* params)
++	{
++		CefComponent* self = component();
++		if (!self || !self->server_ || !(*self->server_)->is_running() || pawnParamCount(params) != 2) return 0;
++		IPawnScript* script = self->scriptFromAmx(amx);
++		std::string challenge;
++		if (!script || !self->getAmxString(*script, params[2], challenge)) return 0;
++		return (*self->server_)->bind_game_connection(static_cast<int>(params[1]), asRustStr(challenge)) ? 1 : 0;
++	}
++
+ 	static cell AMX_NATIVE_CALL nativeOnPlayerConnect(AMX* amx, const cell* params)
+ 	{
+ 		CefComponent* self = component();
+@@ -1384,14 +1416,13 @@
+ 			return 0;
+ 		}
+ 
+-		(*self->server_)
++		return (*self->server_)
+ 			->create_browser(
+ 				static_cast<int>(params[1]),
+ 				static_cast<int>(params[2]),
+ 				asRustStr(url),
+ 				params[4] != 0,
+-				params[5] != 0);
+-		return 1;
++				params[5] != 0) ? 1 : 0;
+ 	}
+ 
+ 	static cell AMX_NATIVE_CALL nativeDestroyBrowser(AMX*, const cell* params)
+@@ -1406,20 +1437,20 @@
+ 		return 1;
+ 	}
+ 
+-	static cell AMX_NATIVE_CALL nativeEmitEvent(AMX* amx, const cell* params)
++	static cell AMX_NATIVE_CALL nativeEmitBrowserEvent(AMX* amx, const cell* params)
+ 	{
+ 		CefComponent* self = component();
+-		if (!self || !self->server_ || !self->requireParams(params, 2, "cef_emit_event"))
++		if (!self || !self->server_ || !self->requireParams(params, 3, "cef_emit_browser_event"))
+ 		{
+ 			return 0;
+ 		}
+ 
+ 		const int count = pawnParamCount(params);
+-		if ((count - 2) % 2 != 0)
++		if ((count - 3) % 2 != 0 || count > 67 || params[2] < 0)
+ 		{
+ 			if (self->core_)
+ 			{
+-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event has an incomplete argument pair");
++				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event has an incomplete argument pair");
+ 			}
+ 			return 0;
+ 		}
+@@ -1429,30 +1460,30 @@
+ 		{
+ 			if (self->core_)
+ 			{
+-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not resolve the Pawn script");
++				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not resolve the Pawn script");
+ 			}
+ 			return 0;
+ 		}
+ 
+ 		std::string eventName;
+-		if (!self->getAmxString(*script, params[2], eventName))
++		if (!self->getAmxString(*script, params[3], eventName))
+ 		{
+ 			if (self->core_)
+ 			{
+-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read the event name");
++				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read the event name");
+ 			}
+ 			return 0;
+ 		}
+ 
+ 		auto arguments = samp_cef::openmp::new_event_arguments();
+-		for (int idx = 3; idx <= count; idx += 2)
++		for (int idx = 4; idx <= count; idx += 2)
+ 		{
+ 			cell typeValue = 0;
+ 			if (!self->getAmxCell(*script, params[idx], typeValue))
+ 			{
+ 				if (self->core_)
+ 				{
+-					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read argument type at index %d", idx);
++					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read argument type at index %d", idx);
+ 				}
+ 				return 0;
+ 			}
+@@ -1469,7 +1500,7 @@
+ 				{
+ 					if (self->core_)
+ 					{
+-						self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read string argument at index %d", idx);
++						self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read string argument at index %d", idx);
+ 					}
+ 					return 0;
+ 				}
+@@ -1495,27 +1526,28 @@
+ 				{
+ 					return 0;
+ 				}
+-				arguments->push_float(amx_ctof(floatValue));
++				const float number = amx_ctof(floatValue);
++				if (!std::isfinite(number)) return 0;
++				arguments->push_float(number);
+ 				break;
+ 			}
+ 
+ 			default:
+ 				if (self->core_)
+ 				{
+-					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event has invalid argument type %d at index %d", type, idx);
++					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event has invalid argument type %d at index %d", type, idx);
+ 				}
+ 				return 0;
+ 			}
+ 		}
+ 
+-		(*self->server_)->emit_event(static_cast<int>(params[1]), asRustStr(eventName), *arguments);
+-		return 1;
+-	}
+-
+-	static cell AMX_NATIVE_CALL nativeSubscribe(AMX* amx, const cell* params)
++		return (*self->server_)->emit_browser_event(static_cast<int>(params[1]), static_cast<std::uint32_t>(params[2]), asRustStr(eventName), *arguments) ? 1 : 0;
++	}
++
++	static cell AMX_NATIVE_CALL nativeSubscribeBrowser(AMX* amx, const cell* params)
+ 	{
+ 		CefComponent* self = component();
+-		if (!self || !self->requireParams(params, 2, "cef_subscribe"))
++		if (!self || !self->server_ || !(*self->server_)->is_running() || pawnParamCount(params) != 2)
+ 		{
+ 			return 0;
+ 		}
+@@ -1533,6 +1565,9 @@
+ 			return 0;
+ 		}
+ 
++		if (eventName.empty() || eventName.size() > 64 || callback.empty() || callback.size() > 64
++			|| !std::all_of(eventName.begin(), eventName.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == ':' || c == '.'; })
++			|| !std::all_of(callback.begin(), callback.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; })) return 0;
+ 		self->subscriptions_[eventName] = Subscription { script, callback };
+ 		return 1;
+ 	}
+@@ -1585,35 +1620,10 @@
+ 		return (*self->server_)->has_plugin(static_cast<int>(params[1])) ? 1 : 0;
+ 	}
+ 
+-	static cell AMX_NATIVE_CALL nativeCreateExternalBrowser(AMX* amx, const cell* params)
+-	{
+-		CefComponent* self = component();
+-		if (!self || !self->server_ || !self->requireParams(params, 5, "cef_create_ext_browser"))
+-		{
+-			return 0;
+-		}
+-
+-		IPawnScript* script = self->scriptFromAmx(amx);
+-		if (!script)
+-		{
+-			return 0;
+-		}
+-
+-		std::string texture;
+-		std::string url;
+-		if (!self->getAmxString(*script, params[3], texture) || !self->getAmxString(*script, params[4], url))
+-		{
+-			return 0;
+-		}
+-
+-		(*self->server_)
+-			->create_external_browser(
+-				static_cast<int>(params[1]),
+-				static_cast<int>(params[2]),
+-				asRustStr(texture),
+-				asRustStr(url),
+-				static_cast<int>(params[5]));
+-		return 1;
++	static cell AMX_NATIVE_CALL nativeCreateExternalBrowser(AMX*, const cell*)
++	{
++		// Fresh browser generations require destroy/create in protocol 1.
++		return 0;
+ 	}
+ 
+ 	static cell AMX_NATIVE_CALL nativeAppendToObject(AMX*, const cell* params)
+@@ -1671,29 +1681,12 @@
+ 		return 1;
+ 	}
+ 
+-	static cell AMX_NATIVE_CALL nativeLoadUrl(AMX* amx, const cell* params)
+-	{
+-		CefComponent* self = component();
+-		if (!self || !self->server_ || !self->requireParams(params, 3, "cef_load_url"))
+-		{
+-			return 0;
+-		}
+-
+-		IPawnScript* script = self->scriptFromAmx(amx);
+-		if (!script)
+-		{
+-			return 0;
+-		}
+-
+-		std::string url;
+-		if (!self->getAmxString(*script, params[3], url))
+-		{
+-			return 0;
+-		}
+-
+-		(*self->server_)->load_url(static_cast<int>(params[1]), static_cast<std::uint32_t>(params[2]), asRustStr(url));
+-		return 1;
+-	}
++	static cell AMX_NATIVE_CALL nativeLoadUrl(AMX*, const cell*)
++	{
++		// Fresh browser generations require destroy/create in protocol 1.
++		return 0;
++	}
++
+ };
+ 
+ CefComponent* CefComponent::instance_ = nullptr;
+diff --git a/openmp-component/component/src/pawn_callback_guard.hpp b/openmp-component/component/src/pawn_callback_guard.hpp
+new file mode 100644
+--- /dev/null
++++ b/openmp-component/component/src/pawn_callback_guard.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++
++// The SDK releases argument strings, but a partial PushOne failure can leave
++// scalar arguments and paramcount on the AMX stack. Restore all call-local
++// allocation state on every exit, including failed pushes and Pawn errors.
++template <typename Script>
++class PawnCallbackGuard final
++{
++public:
++	explicit PawnCallbackGuard(Script& script)
++		: script_(script), heap_(script.GetHEA()), stack_(script.GetSTK()),
++		  parameterCount_(script.GetAMX()->paramcount)
++	{
++	}
++
++	~PawnCallbackGuard()
++	{
++		script_.Release(heap_);
++		script_.SetSTK(stack_);
++		script_.GetAMX()->paramcount = parameterCount_;
++	}
++
++	PawnCallbackGuard(const PawnCallbackGuard&) = delete;
++	PawnCallbackGuard& operator=(const PawnCallbackGuard&) = delete;
++
++private:
++	Script& script_;
++	decltype(script_.GetHEA()) heap_;
++	decltype(script_.GetSTK()) stack_;
++	int parameterCount_;
++};
+diff --git a/openmp-component/src/lib.rs b/openmp-component/src/lib.rs
+--- a/openmp-component/src/lib.rs
++++ b/openmp-component/src/lib.rs
+@@ -60,6 +60,7 @@
+         kind: EventKind,
+         player_id: i32,
+         browser_id: u32,
++        browser_generation: u32,
+         code: i32,
+         success: bool,
+         event: String,
+@@ -71,17 +72,21 @@
+         type EventArguments;
+ 
+         fn create_server_core(bind: &str, port: u16) -> Box<ServerCore>;
++        fn pawn_to_utf8(bytes: &[u8]) -> String;
++        fn utf8_to_pawn(value: &str) -> Vec<u8>;
+ 
+         fn is_running(self: &ServerCore) -> bool;
+         fn last_error(self: &ServerCore) -> String;
+ 
+         fn allow_connection(self: &mut ServerCore, player_id: i32, ip: &str) -> bool;
+         fn remove_connection(self: &mut ServerCore, player_id: i32);
++        fn bind_game_connection(self: &ServerCore, player_id: i32, token: &str) -> bool;
++        fn emit_browser_event(self: &ServerCore, player_id: i32, browser_id: u32, event: &str, arguments: &EventArguments) -> bool;
+ 
+         fn create_browser(
+             self: &mut ServerCore, player_id: i32, browser_id: i32, url: &str, hidden: bool,
+             focused: bool,
+-        );
++        ) -> bool;
+         fn destroy_browser(self: &mut ServerCore, player_id: i32, browser_id: i32);
+         fn hide_browser(self: &ServerCore, player_id: i32, browser_id: i32, hide: bool);
+         fn focus_browser(self: &ServerCore, player_id: i32, browser_id: i32, focused: bool);
+@@ -174,12 +179,14 @@
+         }
+     }
+ 
+-    fn create_browser(
+-        &mut self, player_id: i32, browser_id: i32, url: &str, hidden: bool, focused: bool,
+-    ) {
+-        if let Some(inner) = self.inner.as_mut() {
+-            inner.create_browser(player_id, browser_id, url.to_owned(), hidden, focused);
+-        }
++    fn bind_game_connection(&self, player_id: i32, token: &str) -> bool {
++        self.inner.as_ref().is_some_and(|inner| inner.bind_game_connection(player_id, token))
++    }
++    fn emit_browser_event(&self, player_id: i32, browser_id: u32, event: &str, arguments: &EventArguments) -> bool {
++        self.inner.as_ref().is_some_and(|inner| inner.emit_browser_event(player_id, browser_id, event, arguments.values.clone()))
++    }
++    fn create_browser(&mut self, player_id: i32, browser_id: i32, url: &str, hidden: bool, focused: bool) -> bool {
++        self.inner.as_mut().is_some_and(|inner| inner.create_browser(player_id, browser_id, url.to_owned(), hidden, focused))
+     }
+ 
+     fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
+@@ -274,10 +281,14 @@
+             Some(CoreEvent::EmitEvent {
+                 player_id,
+                 event,
++                browser_id,
++                browser_generation,
+                 arguments,
+             }) => ffi::ServerEvent {
+                 kind: ffi::EventKind::EmitEvent,
+                 player_id,
++                browser_id,
++                browser_generation,
+                 event,
+                 arguments,
+                 ..empty_event()
+@@ -293,11 +304,13 @@
+             Some(CoreEvent::BrowserCreated {
+                 player_id,
+                 browser_id,
++                browser_generation,
+                 code,
+             }) => ffi::ServerEvent {
+                 kind: ffi::EventKind::BrowserCreated,
+                 player_id,
+                 browser_id,
++                browser_generation,
+                 code,
+                 ..empty_event()
+             },
+@@ -342,9 +355,28 @@
+         kind: ffi::EventKind::None,
+         player_id: 0,
+         browser_id: 0,
++        browser_generation: 0,
+         code: 0,
+         success: false,
+         event: String::new(),
+         arguments: String::new(),
+     }
+ }
++
++fn pawn_to_utf8(bytes: &[u8]) -> String { encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned() }
++fn utf8_to_pawn(value: &str) -> Vec<u8> {
++    let (bytes, _, errors) = encoding_rs::WINDOWS_1252.encode(value);
++    if errors { Vec::new() } else { bytes.into_owned() }
++}
++
++#[cfg(test)]
++mod encoding_tests {
++    use super::*;
++    #[test] fn component_cp1252_boundary_preserves_umlauts_and_json_escapes() {
++        let json = "{\"text\":\"Gr\u{00fc}\u{00df}e \u{20ac}\",\"escaped\":\"\\u00fc\"}";
++        let bytes = utf8_to_pawn(json);
++        assert!(bytes.contains(&252)); assert!(bytes.contains(&223)); assert!(bytes.contains(&128));
++        assert_eq!(pawn_to_utf8(&bytes), json);
++        assert!(utf8_to_pawn("\u{1f600}").is_empty());
++    }
++}
+diff --git a/proto/packets.proto b/proto/packets.proto
+--- a/proto/packets.proto
++++ b/proto/packets.proto
+@@ -42,6 +42,7 @@
+     required string url = 2;
+     required bool hidden = 3;
+     required bool focused = 4;
++    required uint32 browser_generation = 5;
+ }
+ 
+ message DestroyBrowser {
+@@ -57,6 +58,8 @@
+     required string event_name = 1;
+     optional string args = 2;
+     repeated EventValue arguments = 3;
++    optional uint32 browser_id = 4;
++    optional uint32 browser_generation = 5;
+ }
+ 
+ message HideBrowser {
+@@ -78,13 +81,14 @@
+ message BrowserCreated {
+     required uint32 browser_id = 1;
+     required int32 status_code = 2;
++    required uint32 browser_generation = 3;
+ }
+ 
+ message Got {
+ 
+ }
+ 
+-message OpenConnection {}
++message OpenConnection { required string bind_token = 1; }
+ 
+ message CreateExternalBrowser {
+     required uint32 browser_id = 1;
+diff --git a/renderer/src/main.rs b/renderer/src/main.rs
+--- a/renderer/src/main.rs
++++ b/renderer/src/main.rs
+@@ -19,7 +19,7 @@
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ 
+-type Callbacks = HashMap<String, Vec<(V8Value, V8Context)>>;
++type Callbacks = HashMap<(i32, String), Vec<(V8Value, V8Context)>>;
+ const ASSET_SCHEME: &str = "sampcef";
+ const ASSET_SCHEME_OPTIONS: i32 = cef_sys::cef_scheme_options_t::CEF_SCHEME_OPTION_STANDARD
+     | cef_sys::cef_scheme_options_t::CEF_SCHEME_OPTION_SECURE
+@@ -34,6 +34,7 @@
+ 
+ impl V8Handler for Handler {
+     fn execute(&self, name: CefString, args: Vec<V8Value>) -> bool {
++        if !trusted_frame(&self.frame) { return false; }
+         let name = name.to_string();
+ 
+         match name.as_str() {
+@@ -82,7 +83,7 @@
+                 let func = args[1].clone();
+ 
+                 let mut events = self.subs.lock().unwrap();
+-                let subs = events.entry(name).or_default();
++                let subs = events.entry((self.frame.browser().identifier(), name)).or_default();
+ 
+                 let ctx = V8Context::current_context();
+                 subs.push((func, ctx));
+@@ -100,7 +101,7 @@
+ 
+                 let mut events = self.subs.lock().unwrap();
+ 
+-                if let Some(subs) = events.get_mut(&name) {
++                if let Some(subs) = events.get_mut(&(self.frame.browser().identifier(), name)) {
+                     let ctx = V8Context::current_context();
+ 
+                     if let Some(idx) = subs
+@@ -171,6 +172,7 @@
+ 
+ impl RenderProcessHandler for Application {
+     fn on_context_created(&self, _browser: Browser, frame: Frame, context: V8Context) {
++        if !trusted_frame(&frame) { return; }
+         let handler = Handler {
+             subs: self.subs.clone(),
+             frame,
+@@ -219,8 +221,9 @@
+     fn on_webkit_initialized(&self) {}
+ 
+     fn on_process_message(
+-        &self, _browser: Browser, _frame: Frame, _source: ProcessId, msg: ProcessMessage,
++        &self, browser: Browser, frame: Frame, source: ProcessId, msg: ProcessMessage,
+     ) -> bool {
++        if !matches!(source, ProcessId::Browser) || !trusted_frame(&frame) { return false; }
+         let name = msg.name().to_string();
+ 
+         if name == "trigger_event" {
+@@ -229,7 +232,7 @@
+             if let Some(list) = args.list(1) {
+                 let events = self.subs.lock().unwrap();
+ 
+-                if let Some(subs) = events.get(&event) {
++                if let Some(subs) = events.get(&(browser.identifier(), event)) {
+                     let subs_clone = subs.clone();
+ 
+                     drop(events); // drop lock
+@@ -253,6 +256,10 @@
+ 
+         false
+     }
++}
++
++fn trusted_frame(frame: &Frame) -> bool {
++    frame.is_main() && cef::local_policy::allows_asset_url(&frame.url())
+ }
+ 
+ fn main() {
+diff --git a/server-core/Cargo.toml b/server-core/Cargo.toml
+--- a/server-core/Cargo.toml
++++ b/server-core/Cargo.toml
+@@ -11,3 +11,5 @@
+ messages = { path = "../messages", package = "cef-messages" }
+ network = { path = "../network", package = "cef-network" }
+ quick-protobuf = "0.8.1"
++
++getrandom = "=0.2.17"
+diff --git a/server-core/src/auth.rs b/server-core/src/auth.rs
+new file mode 100644
+--- /dev/null
++++ b/server-core/src/auth.rs
+@@ -0,0 +1,118 @@
++//! The game callback is the sole authority for player identity. No IP address participates.
++use std::collections::HashMap;
++use std::hash::Hash;
++use std::time::{Duration, Instant};
++
++pub const TOKEN_TTL: Duration = Duration::from_secs(15);
++const MAX_PENDING: usize = 128;
++struct Pending<P> { peer: P, until: Instant, eligible: HashMap<i32, u64> }
++
++pub struct Auth<P> {
++    serial: u64,
++    games: HashMap<i32, u64>,
++    pending: HashMap<String, Pending<P>>,
++    bound: HashMap<P, (i32, u64)>,
++}
++
++impl<P: Copy + Eq + Hash> Default for Auth<P> {
++    fn default() -> Self {
++        Self { serial: 0, games: HashMap::new(), pending: HashMap::new(), bound: HashMap::new() }
++    }
++}
++
++pub fn valid_token(token: &str) -> bool {
++    token.len() == 64 && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++impl<P: Copy + Eq + Hash> Auth<P> {
++    pub fn connect_game(&mut self, player: i32) {
++        self.disconnect_game(player);
++        self.serial = self.serial.checked_add(1).expect("game generation exhausted");
++        self.games.insert(player, self.serial);
++    }
++    pub fn disconnect_game(&mut self, player: i32) {
++        self.games.remove(&player);
++        self.bound.retain(|_, (id, _)| *id != player);
++        for pending in self.pending.values_mut() { pending.eligible.remove(&player); }
++    }
++    pub fn issue(&mut self, peer: P, token: String, now: Instant) -> bool {
++        if !valid_token(&token) || self.pending.len() >= MAX_PENDING || self.pending.contains_key(&token)
++            || self.bound.contains_key(&peer) || self.pending.values().any(|p| p.peer == peer) {
++            return false;
++        }
++        self.pending.insert(token, Pending { peer, until: now + TOKEN_TTL, eligible: self.games.clone() });
++        true
++    }
++    pub fn pending_peer(&self, token: &str) -> Option<P> { self.pending.get(token).map(|pending| pending.peer) }
++    pub fn bind(&mut self, player: i32, token: &str, now: Instant) -> Option<(P, u64)> {
++        if !valid_token(token) { return None; }
++        // Consume even a rejected proof, preventing repeated identity guesses.
++        let pending = self.pending.remove(token)?;
++        let generation = *self.games.get(&player)?;
++        if now >= pending.until || pending.eligible.get(&player) != Some(&generation)
++            || self.peer_for(player).is_some() || self.bound.contains_key(&pending.peer) { return None; }
++        self.bound.insert(pending.peer, (player, generation));
++        Some((pending.peer, generation))
++    }
++    pub fn identity(&self, peer: P) -> Option<(i32, u64)> { self.bound.get(&peer).copied() }
++    pub fn is_current(&self, peer: P, player: i32, generation: u64) -> bool {
++        self.identity(peer) == Some((player, generation)) && self.games.get(&player) == Some(&generation)
++    }
++    pub fn peer_for(&self, player: i32) -> Option<P> {
++        self.bound.iter().find_map(|(p, (id, _))| (*id == player).then_some(*p))
++    }
++    pub fn game_generation(&self, player: i32) -> Option<u64> { self.games.get(&player).copied() }
++    pub fn disconnect_peer(&mut self, peer: P) {
++        self.bound.remove(&peer);
++        self.pending.retain(|_, pending| pending.peer != peer);
++    }
++    pub fn expire(&mut self, now: Instant) -> Vec<P> {
++        let peers = self.pending.values().filter(|p| now >= p.until).map(|p| p.peer).collect();
++        self.pending.retain(|_, p| now < p.until);
++        peers
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn token(n: u32) -> String { format!("{n:064x}") }
++    #[test] fn independent_peers_without_ip_identity() {
++        let mut a = Auth::default(); let now = Instant::now();
++        a.connect_game(7); a.connect_game(8);
++        assert!(a.issue(10, token(1), now)); assert!(a.issue(11, token(2), now));
++        assert_eq!(a.identity(10), None);
++        assert_eq!(a.bind(8, &token(2), now).unwrap().0, 11);
++        assert_eq!(a.bind(7, &token(1), now).unwrap().0, 10);
++    }
++    #[test] fn replay_expiry_and_duplicate_binding_fail() {
++        let mut a = Auth::default(); let now = Instant::now(); a.connect_game(7);
++        a.issue(10, token(1), now); assert!(a.bind(7, &token(1), now).is_some());
++        assert!(a.bind(7, &token(1), now).is_none());
++        a.issue(11, token(2), now); assert!(a.bind(7, &token(2), now).is_none());
++        a.disconnect_game(7); a.connect_game(7);
++        a.issue(12, token(3), now); assert!(a.bind(7, &token(3), now + TOKEN_TTL).is_none());
++    }
++    #[test] fn reused_slot_rejects_pending_tokens_and_queued_callbacks() {
++        let mut a = Auth::default(); let now = Instant::now(); a.connect_game(7);
++        a.issue(10, token(1), now); let (_, old) = a.bind(7, &token(1), now).unwrap();
++        a.issue(11, token(2), now); a.disconnect_game(7); a.connect_game(7);
++        assert!(!a.is_current(10, 7, old)); assert!(a.bind(7, &token(2), now).is_none());
++        a.issue(12, token(3), now); let (_, fresh) = a.bind(7, &token(3), now).unwrap();
++        assert_ne!(old, fresh); assert!(a.is_current(12, 7, fresh));
++        a.disconnect_peer(12); assert!(!a.is_current(12, 7, fresh));
++    }
++    #[test] fn expiry_capacity_and_format_are_bounded() {
++        let mut a = Auth::default(); let now = Instant::now(); a.connect_game(0);
++        assert!(!a.issue(1, "A".repeat(64), now)); assert!(!valid_token(&"1".repeat(63)));
++        for n in 0..MAX_PENDING as u32 { assert!(a.issue(n, token(n), now)); }
++        assert!(!a.issue(999, token(999), now));
++        assert_eq!(a.expire(now + TOKEN_TTL).len(), MAX_PENDING);
++        assert!(a.issue(999, token(999), now));
++    }
++    #[test] fn token_issued_before_game_is_not_eligible_for_future_slot() {
++        let mut a = Auth::default(); let now = Instant::now();
++        a.issue(10, token(1), now); a.connect_game(7);
++        assert!(a.bind(7, &token(1), now).is_none());
++    }
++}
+diff --git a/server-core/src/lib.rs b/server-core/src/lib.rs
+--- a/server-core/src/lib.rs
++++ b/server-core/src/lib.rs
+@@ -1,140 +1,57 @@
+-use std::collections::VecDeque;
+ use std::net::{IpAddr, SocketAddr};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+-
++use std::collections::HashMap;
+ use crossbeam_channel::Receiver;
+-use tracing::trace;
+-
+-mod client;
++use network::PeerId;
++mod auth;
+ mod server;
+-
+ use crate::server::Server;
+-
+ pub use messages::packets::EventValue;
+-
+-const INIT_TIMEOUT: Duration = Duration::from_secs(5);
+-
++const EVENT_SCAN_BUDGET: usize = 128;
++const INIT_TIMEOUT: Duration = Duration::from_secs(20);
+ #[derive(Debug, Clone)]
+ pub enum CoreEvent {
+-    EmitEvent {
+-        player_id: i32,
+-        event: String,
+-        arguments: String,
+-    },
+-    PlayerInitialized {
+-        player_id: i32,
+-        success: bool,
+-    },
+-    BrowserCreated {
+-        player_id: i32,
+-        browser_id: u32,
+-        code: i32,
+-    },
++    EmitEvent { player_id: i32, browser_id: u32, browser_generation: u32, event: String, arguments: String },
++    PlayerInitialized { player_id: i32, success: bool },
++    BrowserCreated { player_id: i32, browser_id: u32, browser_generation: u32, code: i32 },
+ }
+-
+ #[derive(Debug)]
+ pub(crate) enum ServerEvent {
+-    EmitEvent {
+-        player_id: i32,
+-        event: String,
+-        arguments: String,
+-    },
+-    PlayerConnected(i32),
+-    BrowserCreated {
+-        player_id: i32,
+-        browser_id: u32,
+-        code: i32,
+-    },
++    EmitEvent { peer: PeerId, player_id: i32, game_generation: u64, browser_id: u32, browser_generation: u32, event: String, arguments: String },
++    PlayerConnected { peer: PeerId, player_id: i32, game_generation: u64 },
++    BrowserCreated { peer: PeerId, player_id: i32, game_generation: u64, browser_id: u32, browser_generation: u32, code: i32 },
+ }
+-
+-enum AwaitConnection {
+-    Pending(Instant),
+-    TimedOut,
++pub struct ServerCore {
++    server: Arc<Mutex<Server>>, event_rx: Receiver<ServerEvent>,
++    await_connect: HashMap<i32, (u64, Instant, bool)>,
+ }
+-
+-impl AwaitConnection {
+-    fn notify_timeout(&mut self, now: Instant) -> bool {
+-        let AwaitConnection::Pending(started_at) = self else {
+-            return false;
+-        };
+-
+-        if now.duration_since(*started_at) < INIT_TIMEOUT {
+-            return false;
+-        }
+-
+-        *self = AwaitConnection::TimedOut;
+-        true
+-    }
+-}
+-
+-pub struct ServerCore {
+-    server: Arc<Mutex<Server>>,
+-    event_rx: Receiver<ServerEvent>,
+-    await_connect: std::collections::HashMap<i32, AwaitConnection>,
+-    ips: std::collections::HashMap<i32, IpAddr>,
+-    pending_events: VecDeque<CoreEvent>,
++impl Drop for ServerCore {
++    fn drop(&mut self) { Server::shutdown(&self.server); }
+ }
+ 
+ impl ServerCore {
+     pub fn new(addr: SocketAddr) -> Result<Self, String> {
+         let server = Server::new(addr)?;
+-
+-        let event_rx = {
+-            let s = server.lock().unwrap();
+-            s.receiver()
+-        };
+-
+-        Ok(Self {
+-            server,
+-            event_rx,
+-            await_connect: std::collections::HashMap::new(),
+-            ips: std::collections::HashMap::new(),
+-            pending_events: VecDeque::new(),
+-        })
++        let event_rx = server.lock().unwrap().receiver();
++        Ok(Self { server, event_rx, await_connect: HashMap::new() })
+     }
+-
+     pub fn allow_connection(&mut self, player_id: i32, addr: IpAddr) {
+-        trace!("allow_connection {} {:?}", player_id, addr);
+-
+-        self.ips.insert(player_id, addr);
+-
+-        let already_connected = {
+-            let server = self.server.lock().unwrap();
+-            server.has_plugin(player_id)
+-        };
+-
+-        {
+-            let mut server = self.server.lock().unwrap();
+-            server.allow_connection(player_id, addr);
+-        }
+-
+-        if !already_connected {
+-            self.await_connect
+-                .insert(player_id, AwaitConnection::Pending(Instant::now()));
+-        }
++        let mut server = self.server.lock().unwrap();
++        server.allow_connection(player_id, addr);
++        if let Some(generation) = server.game_generation(player_id) { self.await_connect.insert(player_id, (generation, Instant::now(), false)); }
+     }
+-
+     pub fn remove_connection(&mut self, player_id: i32) {
+-        trace!("remove_connection {}", player_id);
+-
+-        let ip = self.ips.remove(&player_id);
+-
+-        {
+-            let mut server = self.server.lock().unwrap();
+-            server.remove_connection(player_id, ip);
+-        }
+-
++        self.server.lock().unwrap().remove_connection(player_id, None);
+         self.await_connect.remove(&player_id);
+     }
+-
+-    pub fn create_browser(
+-        &mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool,
+-    ) {
+-        let mut server = self.server.lock().unwrap();
+-        server.create_browser(player_id, browser_id, url, hidden, focused);
++    pub fn bind_game_connection(&self, player_id: i32, token: &str) -> bool { self.server.lock().unwrap().bind_game_connection(player_id, token) }
++    pub fn create_browser(&mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool) -> bool {
++        self.server.lock().unwrap().create_browser(player_id, browser_id, url, hidden, focused)
+     }
+-
++    pub fn emit_browser_event(&self, player_id: i32, browser_id: u32, event: &str, arguments: Vec<EventValue<'static>>) -> bool {
++        self.server.lock().unwrap().emit_browser_event(player_id, browser_id, event, arguments)
++    }
+     pub fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
+         let mut server = self.server.lock().unwrap();
+         server.destroy_browser(player_id, browser_id);
+@@ -200,92 +117,50 @@
+     }
+ 
+     pub fn poll_event(&mut self) -> Option<CoreEvent> {
+-        if let Some(event) = self.pending_events.pop_front() {
+-            return Some(event);
+-        }
+-
+-        while let Ok(event) = self.event_rx.try_recv() {
++        // A producer or a stale-event flood must never hold the game tick here.
++        for _ in 0..EVENT_SCAN_BUDGET {
++            let Ok(event) = self.event_rx.try_recv() else { break; };
++            let server = self.server.lock().unwrap();
+             match event {
+-                ServerEvent::EmitEvent {
+-                    player_id,
+-                    event,
+-                    arguments,
+-                } => {
+-                    self.pending_events.push_back(CoreEvent::EmitEvent {
+-                        player_id,
+-                        event,
+-                        arguments,
+-                    });
+-                }
+-
+-                ServerEvent::PlayerConnected(player_id) => {
+-                    trace!("poll_event::PlayerConnected({})", player_id);
+-
+-                    if self.await_connect.remove(&player_id).is_some() {
+-                        self.pending_events.push_back(CoreEvent::PlayerInitialized {
+-                            player_id,
+-                            success: true,
+-                        });
++                ServerEvent::EmitEvent { peer, player_id, game_generation, browser_id, browser_generation, event, arguments } => {
++                    if server.current_event(peer, player_id, game_generation, Some((browser_id, browser_generation))) && server.browser_accepts_events(player_id, browser_id, browser_generation) {
++                        return Some(CoreEvent::EmitEvent { player_id, browser_id, browser_generation, event, arguments });
+                     }
+                 }
+-
+-                ServerEvent::BrowserCreated {
+-                    player_id,
+-                    browser_id,
+-                    code,
+-                } => {
+-                    self.pending_events.push_back(CoreEvent::BrowserCreated {
+-                        player_id,
+-                        browser_id,
+-                        code,
+-                    });
++                ServerEvent::PlayerConnected { peer, player_id, game_generation } => {
++                    if server.current_event(peer, player_id, game_generation, None) {
++                        self.await_connect.remove(&player_id);
++                        return Some(CoreEvent::PlayerInitialized { player_id, success: true });
++                    }
++                }
++                ServerEvent::BrowserCreated { peer, player_id, game_generation, browser_id, browser_generation, code } => {
++                    if server.current_event(peer, player_id, game_generation, Some((browser_id, browser_generation))) {
++                        return Some(CoreEvent::BrowserCreated { player_id, browser_id, browser_generation, code });
++                    }
+                 }
+             }
+         }
+-
+-        self.notify_timeouts();
+-        self.pending_events.pop_front()
+-    }
+-
+-    fn notify_timeouts(&mut self) {
+-        let mut keys = Vec::new();
+-
+-        let now = Instant::now();
+-        for (&player_id, state) in self.await_connect.iter_mut() {
+-            if state.notify_timeout(now) {
+-                keys.push(player_id);
++        for (&player_id, (generation, start, notified)) in &mut self.await_connect {
++            if !*notified && start.elapsed() >= INIT_TIMEOUT {
++                *notified = true;
++                if self.server.lock().unwrap().game_generation(player_id) == Some(*generation) {
++                    return Some(CoreEvent::PlayerInitialized { player_id, success: false });
++                }
+             }
+         }
+-
+-        for player_id in keys {
+-            self.pending_events.push_back(CoreEvent::PlayerInitialized {
+-                player_id,
+-                success: false,
+-            });
+-        }
++        None
+     }
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++mod poll_budget_tests {
+     use super::*;
+-
+-    #[test]
+-    fn timeout_is_reported_once_while_late_connection_remains_expected() {
+-        let now = Instant::now();
+-        let mut state = AwaitConnection::Pending(now - INIT_TIMEOUT);
+-
+-        assert!(state.notify_timeout(now));
+-        assert!(matches!(state, AwaitConnection::TimedOut));
+-        assert!(!state.notify_timeout(now + INIT_TIMEOUT));
+-    }
+-
+-    #[test]
+-    fn connection_does_not_time_out_early() {
+-        let now = Instant::now();
+-        let mut state = AwaitConnection::Pending(now);
+-
+-        assert!(!state.notify_timeout(now + INIT_TIMEOUT - Duration::from_millis(1)));
+-        assert!(matches!(state, AwaitConnection::Pending(_)));
++    #[test] fn stale_events_are_consumed_in_bounded_batches() {
++        let (tx, rx) = crossbeam_channel::bounded(256);
++        let mut core = ServerCore { server: Arc::new(Mutex::new(Server::test_unbound())), event_rx: rx, await_connect: HashMap::new() };
++        for _ in 0..129 { tx.send(ServerEvent::PlayerConnected { peer: PeerId::default(), player_id: 7, game_generation: 1 }).unwrap(); }
++        assert!(core.poll_event().is_none());
++        assert_eq!(core.event_rx.len(), 1, "One tick must scan at most 128 stale events");
++        assert!(core.poll_event().is_none()); assert!(core.event_rx.is_empty());
+     }
+ }
+diff --git a/server-core/src/server.rs b/server-core/src/server.rs
+--- a/server-core/src/server.rs
++++ b/server-core/src/server.rs
+@@ -2,307 +2,204 @@
+ use messages::{packets, try_into_packet};
+ use network::{CertStrategy, Event as SocketEvent, PeerId, Socket};
+ use quick_protobuf::deserialize_from_slice;
+-use tracing::trace;
+-
+ use std::collections::HashMap;
+ use std::convert::TryInto;
+ use std::net::{IpAddr, SocketAddr};
+ use std::sync::{Arc, Mutex};
+-use std::time::Duration;
+-
+-use crate::ServerEvent;
+-use crate::client::Client;
+-use crate::client::State;
+-
+-enum Packet {
+-    Normal { peer: PeerId, bytes: Vec<u8> },
+-    Disconnect(PeerId),
+-}
+-
+-impl Packet {
+-    fn new(peer: PeerId, bytes: Vec<u8>) -> Packet {
+-        Packet::Normal { peer, bytes }
+-    }
+-
+-    fn disconnect(peer: PeerId) -> Packet {
+-        Packet::Disconnect(peer)
+-    }
+-}
+-
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{Duration, Instant};
++use crate::{ServerEvent, auth::Auth};
++
++enum Packet { Normal { peer: PeerId, bytes: Vec<u8> }, Disconnect(PeerId) }
++struct Browser { generation: u32, ready: bool, failed: bool }
++struct Rate { start: Instant, count: u32 }
++fn valid_event_name(s: &str) -> bool {
++    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'.')
++}
++fn local_url(s: &str) -> bool {
++    s.starts_with("sampcef://assets/") && s.len() <= 1024 && !s.contains('\\') && !s.contains("..") && !s.contains(['\r', '\n', '\0'])
++}
+ pub struct Server {
+-    event_tx: Sender<ServerEvent>,
+-    event_rx: Receiver<ServerEvent>,
+-    sender: Sender<Packet>,
+-    allowed: HashMap<IpAddr, i32>,
+-    clients: HashMap<PeerId, Client>,
+-    players: HashMap<i32, PeerId>,
+-}
+-
++    event_tx: Sender<ServerEvent>, event_rx: Receiver<ServerEvent>, sender: Sender<Packet>,
++    auth: Auth<PeerId>, browsers: HashMap<(i32, u32), Browser>, browser_serial: u32,
++    rates: HashMap<PeerId, Rate>,
++    stopping: Arc<AtomicBool>, worker: Option<std::thread::JoinHandle<()>>,
++}
+ impl Server {
+-    pub fn new(addr: SocketAddr) -> Result<Arc<Mutex<Server>>, String> {
+-        let mut socket = Socket::new_server(addr, CertStrategy::SelfSigned)
+-            .map_err(|error| format!("failed to bind CEF server on {addr}: {error}"))?;
+-
+-        let (sender, receiver) = crossbeam_channel::unbounded();
+-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+-
+-        let server = Server {
+-            event_tx,
+-            event_rx,
+-            sender,
+-            allowed: HashMap::new(),
+-            clients: HashMap::new(),
+-            players: HashMap::new(),
+-        };
+-
+-        let server = Arc::new(Mutex::new(server));
+-        let server_clone = server.clone();
+-
+-        std::thread::spawn(move || {
+-            loop {
+-                while let Some(event) = socket.recv() {
+-                    match event {
+-                        SocketEvent::Message(peer, bytes) => {
+-                            if let Ok(proto) = deserialize_from_slice::<packets::Packet>(&bytes) {
+-                                let mut server = server.lock().unwrap();
+-                                server.handle_client_packet(peer, proto);
+-                            }
+-                        }
+-
+-                        SocketEvent::Connected(peer, addr) => {
+-                            let mut server = server.lock().unwrap();
+-                            server.handle_new_connection(peer, addr);
+-                        }
+-
+-                        SocketEvent::Disconnect(peer, _) => {
+-                            let mut server = server.lock().unwrap();
+-                            server.handle_timeout(peer);
+-                        }
+-
+-                        _ => (),
+-                    }
+-                }
+-
+-                for packet in receiver.try_iter() {
+-                    match packet {
+-                        Packet::Normal { peer, bytes } => socket.send_message(peer, bytes),
+-                        Packet::Disconnect(peer) => {
+-                            trace!("socket::disconnect {:?}", peer);
+-                            socket.disconnect(peer);
++    #[cfg(test)]
++    pub(crate) fn test_unbound() -> Self {
++        let (sender, _) = crossbeam_channel::bounded(32);
++        let (event_tx, event_rx) = crossbeam_channel::bounded(256);
++        Self { event_tx, event_rx, sender, auth: Auth::default(), browsers: HashMap::new(), browser_serial: 0, rates: HashMap::new(), stopping: Arc::new(AtomicBool::new(false)), worker: None }
++    }
++    pub fn new(addr: SocketAddr) -> Result<Arc<Mutex<Self>>, String> {
++        let mut socket = Socket::new_server(addr, CertStrategy::FromFiles).map_err(|e| format!("CEF server TLS/bind failed: {e}"))?;
++        let (sender, receiver) = crossbeam_channel::bounded(1024);
++        let (event_tx, event_rx) = crossbeam_channel::bounded(1024);
++        let server = Arc::new(Mutex::new(Self { event_tx, event_rx, sender, auth: Auth::default(), browsers: HashMap::new(), browser_serial: 0, rates: HashMap::new(), stopping: Arc::new(AtomicBool::new(false)), worker: None }));
++        let worker = server.clone();
++        let stopping = server.lock().unwrap().stopping.clone();
++        let handle = std::thread::spawn(move || while !stopping.load(Ordering::Acquire) {
++            while let Some(event) = socket.recv() {
++                if stopping.load(Ordering::Acquire) { return; }
++                let mut server = worker.lock().unwrap();
++                match event {
++                    SocketEvent::Message(peer, bytes) => {
++                        if bytes.len() <= 8192 && server.take_rate(peer) {
++                            if let Ok(packet) = deserialize_from_slice::<packets::Packet>(&bytes) { server.handle_client_packet(peer, packet); }
+                         }
+                     }
++                    SocketEvent::Connected(peer, _) => server.handle_new_connection(peer),
++                    SocketEvent::Disconnect(peer, _) | SocketEvent::ConnectionError(peer) => server.handle_timeout(peer),
+                 }
+-
+-                std::thread::sleep(Duration::from_millis(5));
+             }
+-        });
+-
+-        Ok(server_clone)
+-    }
+-
++            {
++                let mut server = worker.lock().unwrap();
++                for peer in server.auth.expire(Instant::now()) {
++                    server.rates.remove(&peer);
++                    let _ = server.sender.try_send(Packet::Disconnect(peer));
++                }
++            }
++            for packet in receiver.try_iter() {
++                match packet { Packet::Normal { peer, bytes } => socket.send_message(peer, bytes), Packet::Disconnect(peer) => socket.disconnect(peer) }
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        });
++        server.lock().unwrap().worker = Some(handle);
++        Ok(server)
++    }
++    pub fn shutdown(server: &Arc<Mutex<Self>>) {
++        let worker = {
++            let mut server = server.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++            server.stopping.store(true, Ordering::Release);
++            server.worker.take()
++        };
++        // The worker may need this mutex to finish. Never join while holding it.
++        if let Some(worker) = worker { let _ = worker.join(); }
++    }
++    fn take_rate(&mut self, peer: PeerId) -> bool {
++        let Some(rate) = self.rates.get_mut(&peer) else { return false; };
++        if rate.start.elapsed() >= Duration::from_secs(1) { rate.start = Instant::now(); rate.count = 0; }
++        rate.count = rate.count.saturating_add(1); rate.count <= 60
++    }
+     fn handle_client_packet(&mut self, peer: PeerId, packet: packets::Packet) {
+-        use messages::packets::PacketId;
+-
+-        if !self.clients.contains_key(&peer) {
+-            return;
++        // REQUEST_JOIN and all other pre-auth messages are never sufficient proof.
++        if self.auth.identity(peer).is_none() { return; }
++        match packet.packet_id {
++            packets::PacketId::EMIT_EVENT => { if let Ok(p) = deserialize_from_slice(&packet.bytes) { self.handle_emit_event(peer, p); } }
++            packets::PacketId::BROWSER_CREATED => { if let Ok(p) = deserialize_from_slice(&packet.bytes) { self.handle_browser_created(peer, p); } }
++            _ => ()
+         }
+-
+-        match packet.packet_id {
+-            PacketId::REQUEST_JOIN => {
+-                let _ = deserialize_from_slice(&packet.bytes)
+-                    .map(|packet| self.handle_auth(peer, packet));
++    }
++    fn handle_emit_event(&mut self, peer: PeerId, packet: packets::EmitEvent) {
++        let Some((player_id, game_generation)) = self.auth.identity(peer) else { return; };
++        let (Some(browser_id), Some(browser_generation), Some(args)) = (packet.browser_id, packet.browser_generation, packet.args) else { return; };
++        if !valid_event_name(&packet.event_name) || args.len() > 4096 || args.contains('\0') || !packet.arguments.is_empty() { return; }
++        let Some(browser) = self.browsers.get(&(player_id, browser_id)) else { return; };
++        if browser.failed || browser.generation != browser_generation { return; }
++        let _ = self.event_tx.try_send(ServerEvent::EmitEvent {
++            peer, player_id, game_generation, browser_id, browser_generation,
++            event: packet.event_name.into_owned(), arguments: args.into_owned(),
++        });
++    }
++    fn handle_browser_created(&mut self, peer: PeerId, packet: packets::BrowserCreated) {
++        let Some((player_id, game_generation)) = self.auth.identity(peer) else { return; };
++        let Some(browser) = self.browsers.get_mut(&(player_id, packet.browser_id)) else { return; };
++        if browser.generation != packet.browser_generation || browser.ready { return; }
++        browser.ready = true;
++        browser.failed = packet.status_code < 200 || packet.status_code >= 300;
++        let _ = self.event_tx.try_send(ServerEvent::BrowserCreated {
++            peer, player_id, game_generation, browser_id: packet.browser_id,
++            browser_generation: packet.browser_generation, code: packet.status_code,
++        });
++    }
++    fn handle_timeout(&mut self, peer: PeerId) {
++        if let Some((player, _)) = self.auth.identity(peer) { self.browsers.retain(|(id, _), _| *id != player); }
++        self.auth.disconnect_peer(peer); self.rates.remove(&peer);
++    }
++    fn handle_new_connection(&mut self, peer: PeerId) {
++        let mut bytes = [0u8; 32];
++        if getrandom::getrandom(&mut bytes).is_err() { let _ = self.sender.try_send(Packet::Disconnect(peer)); return; }
++        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
++        if !self.auth.issue(peer, token.clone(), Instant::now()) { let _ = self.sender.try_send(Packet::Disconnect(peer)); return; }
++        self.rates.insert(peer, Rate { start: Instant::now(), count: 0 });
++        self.send_peer(peer, packets::OpenConnection { bind_token: token.into() });
++    }
++    pub fn bind_game_connection(&mut self, player_id: i32, token: &str) -> bool {
++        let pending_peer = self.auth.pending_peer(token);
++        let Some((peer, game_generation)) = self.auth.bind(player_id, token, Instant::now()) else {
++            // A consumed failed proof must not leave an unbound connection occupying
++            // the transport limit forever after its pending expiry record is removed.
++            if let Some(peer) = pending_peer {
++                self.auth.disconnect_peer(peer); self.rates.remove(&peer);
++                let _ = self.sender.try_send(Packet::Disconnect(peer));
+             }
+-
+-            PacketId::EMIT_EVENT => {
+-                let _ = deserialize_from_slice(&packet.bytes)
+-                    .map(|packet| self.handle_emit_event(peer, packet));
+-            }
+-
+-            PacketId::BROWSER_CREATED => {
+-                let _ = deserialize_from_slice(&packet.bytes)
+-                    .map(|packet| self.handle_browser_created(peer, packet));
+-            }
+-
+-            _ => (),
+-        }
+-    }
+-
+-    fn handle_auth(&mut self, peer: PeerId, _packet: packets::RequestJoin) {
+-        let client = self.clients.get_mut(&peer).unwrap();
+-
+-        let response = packets::JoinResponse {
+-            success: true,
+-            current_version: None,
++            return false;
+         };
+-
+-        client.set_state(State::Connected);
+-
+-        let _ = self
+-            .event_tx
+-            .send(ServerEvent::PlayerConnected(client.id()));
+-
+-        let _ = try_into_packet(response).map(|bytes| {
+-            let packet = Packet::new(peer, bytes);
+-            let _ = self.sender.send(packet);
+-        });
+-    }
+-
+-    fn handle_emit_event(&mut self, peer: PeerId, packet: packets::EmitEvent) {
+-        let client = self.clients.get_mut(&peer).unwrap();
+-        let player_id = client.id();
+-
+-        if let Some(args) = &packet.args {
+-            let event = packet.event_name.to_string();
+-            let arguments = args.to_string();
+-            let event = ServerEvent::EmitEvent {
+-                player_id,
+-                arguments,
+-                event,
+-            };
+-
+-            let _ = self.event_tx.send(event);
+-        }
+-    }
+-
+-    fn handle_browser_created(&mut self, peer: PeerId, packet: packets::BrowserCreated) {
+-        let client = self.clients.get_mut(&peer).unwrap();
+-        let player_id = client.id();
+-
+-        let event = ServerEvent::BrowserCreated {
+-            player_id,
+-            browser_id: packet.browser_id,
+-            code: packet.status_code,
+-        };
+-
+-        let _ = self.event_tx.send(event);
+-    }
+-
+-    fn handle_timeout(&mut self, addr: PeerId) {
+-        trace!("handle_timeout {:?}", addr);
+-        if let Some(client) = self.clients.remove(&addr) {
+-            self.players.remove(&client.id());
+-        }
+-
+-        trace!("{:#?}", self.allowed);
+-        trace!("{:#?}", self.clients);
+-    }
+-
+-    fn handle_new_connection(&mut self, peer: PeerId, addr: SocketAddr) {
+-        trace!("handle_new_connection {:?} {:?}", peer, addr);
+-
+-        if !self.clients.contains_key(&peer) && self.allowed.contains_key(&addr.ip()) {
+-            let player_id = *self.allowed.get(&addr.ip()).unwrap();
+-
+-            trace!("handle_new_connection: ok {}", player_id);
+-
+-            if self.peer_by_id(player_id).is_none() {
+-                trace!("handle_new_connection: ok no peer with this id");
+-
+-                let client = Client::new(player_id, peer, addr);
+-
+-                self.clients.insert(peer, client);
+-                self.players.insert(player_id, peer);
+-
+-                let request = packets::OpenConnection {};
+-
+-                let _ = try_into_packet(request).map(|bytes| {
+-                    let packet = Packet::new(peer, bytes);
+-                    let _ = self.sender.send(packet);
+-                });
+-
+-                return;
+-            }
+-        }
+-
+-        let packet = Packet::disconnect(peer);
+-        let _ = self.sender.send(packet);
+-    }
+-
+-    pub fn allow_connection(&mut self, player_id: i32, addr: IpAddr) {
+-        if let Some(peer) = self.peer_by_id(player_id) {
+-            let same_addr = self
+-                .clients
+-                .get(&peer)
+-                .map(|client| client.addr().ip() == addr)
+-                .unwrap_or(false);
+-
+-            if !same_addr {
+-                self.clients.remove(&peer);
+-                self.players.remove(&player_id);
+-            }
+-        }
+-
+-        self.allowed.insert(addr, player_id);
+-    }
+-
+-    pub fn remove_connection(&mut self, player_id: i32, addr: Option<IpAddr>) {
+-        let peer = self.peer_by_id(player_id);
+-
+-        if let Some(peer) = peer
+-            && let Some(client) = self.clients.remove(&peer)
+-        {
+-            self.players.remove(&player_id);
+-            self.allowed.remove(&client.addr().ip());
+-            let _ = self.sender.send(Packet::Disconnect(client.peer()));
+-        }
+-
+-        if let Some(addr) = addr {
+-            self.allowed.remove(&addr);
+-        }
+-    }
+-
+-    pub fn create_browser(
+-        &mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool,
+-    ) {
+-        self.send_packet(
+-            player_id,
+-            packets::CreateBrowser {
+-                browser_id: browser_id as u32,
+-                url: url.into(),
+-                hidden,
++        self.send_peer(peer, packets::JoinResponse { success: true, current_version: Some(1) });
++        let _ = self.event_tx.try_send(ServerEvent::PlayerConnected { peer, player_id, game_generation });
++        true
++    }
++    pub fn allow_connection(&mut self, player_id: i32, _addr: IpAddr) {
++        self.remove_connection(player_id, None); self.auth.connect_game(player_id);
++    }
++    pub fn remove_connection(&mut self, player_id: i32, _addr: Option<IpAddr>) {
++        if let Some(peer) = self.auth.peer_for(player_id) { let _ = self.sender.try_send(Packet::Disconnect(peer)); self.rates.remove(&peer); }
++        self.auth.disconnect_game(player_id); self.browsers.retain(|(id, _), _| *id != player_id);
++    }
++    pub fn current_event(&self, peer: PeerId, player: i32, generation: u64, browser: Option<(u32, u32)>) -> bool {
++        self.auth.is_current(peer, player, generation) && browser.is_none_or(|(id, generation)| self.browsers.get(&(player, id)).is_some_and(|b| b.generation == generation))
++    }
++    pub fn browser_accepts_events(&self, player: i32, id: u32, generation: u32) -> bool {
++        self.browsers.get(&(player, id)).is_some_and(|b| b.generation == generation && !b.failed)
++    }
++    pub fn game_generation(&self, player: i32) -> Option<u64> { self.auth.game_generation(player) }
++    pub fn create_browser(&mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool) -> bool {
++        if browser_id < 0 || !local_url(&url) || !self.has_plugin(player_id) { return false; }
++        let Some(generation) = self.browser_serial.checked_add(1).filter(|v| *v <= i32::MAX as u32) else { return false; };
++        self.browser_serial = generation;
++        self.browsers.insert((player_id, browser_id as u32), Browser { generation, ready: false, failed: false });
++        self.send_packet(player_id, packets::CreateBrowser { browser_id: browser_id as u32, browser_generation: generation, url: url.into(), hidden, focused });
++        true
++    }
++    pub fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
++        self.browsers.remove(&(player_id, browser_id as u32));
++        self.send_packet(player_id, packets::DestroyBrowser { browser_id: browser_id as u32 });
++    }
++    pub fn hide_browser(&self, player_id: i32, browser_id: i32, hide: bool) {
++        self.send_packet(
++            player_id,
++            packets::HideBrowser {
++                browser_id: browser_id as u32,
++                hide,
++            },
++        );
++    }
++
++    pub fn focus_browser(&self, player_id: i32, browser_id: i32, focused: bool) {
++        self.send_packet(
++            player_id,
++            packets::FocusBrowser {
++                browser_id: browser_id as u32,
+                 focused,
+             },
+         );
+     }
+ 
+-    pub fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
+-        self.send_packet(
+-            player_id,
+-            packets::DestroyBrowser {
+-                browser_id: browser_id as u32,
+-            },
+-        );
+-    }
+-
+-    pub fn hide_browser(&self, player_id: i32, browser_id: i32, hide: bool) {
+-        self.send_packet(
+-            player_id,
+-            packets::HideBrowser {
+-                browser_id: browser_id as u32,
+-                hide,
+-            },
+-        );
+-    }
+-
+-    pub fn focus_browser(&self, player_id: i32, browser_id: i32, focused: bool) {
+-        self.send_packet(
+-            player_id,
+-            packets::FocusBrowser {
+-                browser_id: browser_id as u32,
+-                focused,
+-            },
+-        );
+-    }
+-
+-    pub fn emit_event(&self, player_id: i32, event: &str, arguments: Vec<packets::EventValue>) {
+-        self.send_packet(
+-            player_id,
+-            packets::EmitEvent {
+-                event_name: event.into(),
+-                args: None,
+-                arguments,
+-            },
+-        );
++    // Legacy broadcast is deliberately disabled in protocol 1.
++    pub fn emit_event(&self, _player_id: i32, _event: &str, _arguments: Vec<packets::EventValue>) {}
++
++    pub fn emit_browser_event(&self, player_id: i32, browser_id: u32, event: &str, arguments: Vec<packets::EventValue>) -> bool {
++        if !valid_event_name(event) || arguments.len() > 32 { return false; }
++        let Some(browser) = self.browsers.get(&(player_id, browser_id)) else { return false; };
++        if browser.failed { return false; }
++        let total: usize = arguments.iter().map(|a| a.string_value.as_ref().map_or(4, |s| s.len())).sum();
++        if total > 60 * 1024 { return false; }
++        self.send_packet(player_id, packets::EmitEvent {
++            event_name: event.into(), args: None, arguments,
++            browser_id: Some(browser_id), browser_generation: Some(browser.generation),
++        });
++        true
+     }
+ 
+     pub fn always_listen_keys(&self, player_id: i32, browser_id: i32, listen: bool) {
+@@ -315,25 +212,9 @@
+         );
+     }
+ 
+-    pub fn has_plugin(&self, player_id: i32) -> bool {
+-        self.peer_by_id(player_id)
+-            .map(|addr| self.clients.contains_key(&addr))
+-            .unwrap_or(false)
+-    }
+-
+-    pub fn create_external_browser(
+-        &self, player_id: i32, browser_id: i32, texture: String, url: String, scale: i32,
+-    ) {
+-        self.send_packet(
+-            player_id,
+-            packets::CreateExternalBrowser {
+-                browser_id: browser_id as u32,
+-                url: url.into(),
+-                texture: texture.into(),
+-                scale,
+-            },
+-        );
+-    }
++    pub fn has_plugin(&self, player_id: i32) -> bool { self.auth.peer_for(player_id).is_some() }
++
++    pub fn create_external_browser(&self, _player_id: i32, _browser_id: i32, _texture: String, _url: String, _scale: i32) {}
+ 
+     pub fn append_to_object(&self, player_id: i32, browser_id: i32, object_id: i32) {
+         self.send_packet(
+@@ -378,38 +259,97 @@
+         );
+     }
+ 
+-    pub fn load_url(&self, player_id: i32, browser_id: u32, url: String) {
+-        self.send_packet(
+-            player_id,
+-            packets::LoadUrl {
+-                browser_id,
+-                url: url.into(),
+-            },
+-        );
+-    }
++    // Navigations need a fresh generation: destroy/create instead.
++    pub fn load_url(&self, _player_id: i32, _browser_id: u32, _url: String) {}
+ 
+     pub fn receiver(&self) -> Receiver<ServerEvent> {
+         self.event_rx.clone()
+     }
+ 
+-    fn send_packet<'a, T: TryInto<packets::Packet<'a>, Error = quick_protobuf::Error>>(
+-        &self, player_id: i32, packet: T,
+-    ) {
+-        if let Some(addr) = self.peer_by_id(player_id) {
+-            let Server {
+-                clients, sender, ..
+-            } = self;
+-
+-            if let Some(client) = clients.get(&addr)
+-                && let Ok(bytes) = try_into_packet(packet)
+-            {
+-                let packet = Packet::new(client.peer(), bytes);
+-                let _ = sender.send(packet);
+-            }
+-        }
+-    }
+-
+-    fn peer_by_id(&self, player_id: i32) -> Option<PeerId> {
+-        self.players.get(&player_id).copied()
+-    }
+-}
++    fn send_packet<'a, T: TryInto<packets::Packet<'a>, Error = quick_protobuf::Error>>(&self, player_id: i32, packet: T) {
++        if let Some(peer) = self.peer_by_id(player_id) { self.send_peer(peer, packet); }
++    }
++    fn send_peer<'a, T: TryInto<packets::Packet<'a>, Error = quick_protobuf::Error>>(&self, peer: PeerId, packet: T) {
++        if let Ok(bytes) = try_into_packet(packet) { let _ = self.sender.try_send(Packet::Normal { peer, bytes }); }
++    }
++    fn peer_by_id(&self, player_id: i32) -> Option<PeerId> { self.auth.peer_for(player_id) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn server() -> (Server, PeerId, u64) {
++        let (sender, _) = crossbeam_channel::bounded(32);
++        let (event_tx, event_rx) = crossbeam_channel::bounded(32);
++        let mut server = Server { event_tx, event_rx, sender, auth: Auth::default(), browsers: HashMap::new(), browser_serial: 0, rates: HashMap::new(), stopping: Arc::new(AtomicBool::new(false)), worker: None };
++        let peer = PeerId::default(); let now = Instant::now(); server.auth.connect_game(7);
++        server.auth.issue(peer, "a".repeat(64), now);
++        let (_, generation) = server.auth.bind(7, &"a".repeat(64), now).unwrap();
++        (server, peer, generation)
++    }
++    fn emit(id: u32, generation: u32, args: &str) -> packets::EmitEvent<'_> {
++        packets::EmitEvent { event_name: "lr:ready".into(), args: Some(args.into()), arguments: Vec::new(), browser_id: Some(id), browser_generation: Some(generation) }
++    }
++    #[test] fn only_registered_browser_and_generation_can_emit() {
++        let (mut s, p, _) = server();
++        s.handle_emit_event(p, emit(1, 1, "{\"ready\":true}")); assert!(s.event_rx.try_recv().is_err());
++        assert!(s.create_browser(7, 1, "sampcef://assets/house/index.html".into(), false, false));
++        s.handle_emit_event(p, emit(1, 1, "{\"ready\":true}"));
++        assert!(matches!(s.event_rx.try_recv(), Ok(ServerEvent::EmitEvent { browser_generation: 1, .. })));
++        s.handle_emit_event(p, emit(1, 2, "0")); assert!(s.event_rx.try_recv().is_err());
++        s.handle_emit_event(p, emit(2, 1, "0")); assert!(s.event_rx.try_recv().is_err());
++    }
++    #[test] fn browser_reuse_and_game_disconnect_invalidate_queued_events() {
++        let (mut s, p, game) = server();
++        s.create_browser(7, 1, "sampcef://assets/house/index.html".into(), false, false);
++        assert!(s.current_event(p, 7, game, Some((1, 1))));
++        s.destroy_browser(7, 1); s.create_browser(7, 1, "sampcef://assets/house/index.html".into(), false, false);
++        assert!(!s.current_event(p, 7, game, Some((1, 1))));
++        s.remove_connection(7, None); assert!(!s.current_event(p, 7, game, None));
++    }
++    #[test] fn load_failure_blocks_events_but_preserves_scoped_failure_callback() {
++        let (mut s, p, game) = server();
++        s.create_browser(7, 1, "sampcef://assets/house/index.html".into(), false, false);
++        s.handle_browser_created(p, packets::BrowserCreated { browser_id: 1, browser_generation: 1, status_code: 404 });
++        assert!(matches!(s.event_rx.try_recv(), Ok(ServerEvent::BrowserCreated { code: 404, .. })));
++        assert!(s.current_event(p, 7, game, Some((1, 1))));
++        assert!(!s.browser_accepts_events(7, 1, 1));
++        s.handle_emit_event(p, emit(1, 1, "0")); assert!(s.event_rx.try_recv().is_err());
++    }
++    #[test] fn shutdown_joins_worker_and_releases_its_server_reference() {
++        let server = Arc::new(Mutex::new(Server::test_unbound()));
++        let held = server.clone();
++        let stopping = server.lock().unwrap().stopping.clone();
++        let handle = std::thread::spawn(move || {
++            while !stopping.load(Ordering::Acquire) { std::thread::yield_now(); }
++            // Proves shutdown released the mutex before waiting for this thread.
++            let _guard = held.lock().unwrap();
++        });
++        server.lock().unwrap().worker = Some(handle);
++        Server::shutdown(&server);
++        assert_eq!(Arc::strong_count(&server), 1);
++        assert!(server.lock().unwrap().worker.is_none());
++        Server::shutdown(&server);
++    }
++    #[test] fn rejected_consumed_proof_disconnects_pending_peer() {
++        let (mut s, p, _) = server();
++        s.auth.disconnect_peer(p);
++        let (tx, rx) = crossbeam_channel::bounded(32); s.sender = tx;
++        assert!(s.auth.issue(p, "b".repeat(64), Instant::now()));
++        s.rates.insert(p, Rate { start: Instant::now(), count: 0 });
++        assert!(!s.bind_game_connection(999, &"b".repeat(64)));
++        assert!(matches!(rx.try_recv(), Ok(Packet::Disconnect(peer)) if peer == p));
++        assert!(s.auth.pending_peer(&"b".repeat(64)).is_none());
++        assert!(!s.rates.contains_key(&p));
++    }
++    #[test] fn limits_and_local_urls_fail_closed() {
++        let (mut s, p, _) = server();
++        assert!(!s.create_browser(7, 1, "https://example.com".into(), false, false));
++        assert!(!s.create_browser(7, 1, "sampcef://assets/../private".into(), false, false));
++        s.create_browser(7, 1, "sampcef://assets/house/index.html".into(), false, false);
++        s.handle_emit_event(p, emit(1, 1, &"x".repeat(4097))); assert!(s.event_rx.try_recv().is_err());
++        s.rates.insert(p, Rate { start: Instant::now(), count: 0 });
++        for _ in 0..60 { assert!(s.take_rate(p)); } assert!(!s.take_rate(p));
++        s.auth.disconnect_peer(p); s.handle_emit_event(p, emit(1, 1, "0")); assert!(s.event_rx.try_recv().is_err());
++    }
++}
+diff --git a/server/Cargo.toml b/server/Cargo.toml
+--- a/server/Cargo.toml
++++ b/server/Cargo.toml
+@@ -13,3 +13,8 @@
+ server-core = { path = "../server-core", package = "cef-server-core" }
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "smallvec"] }
++
++[dev-dependencies]
++messages = { path = "../messages", package = "cef-messages" }
++quick-protobuf = "=0.8.1"
++serde_json = "=1.0.149"
+diff --git a/server/cef.inc b/server/cef.inc
+--- a/server/cef.inc
++++ b/server/cef.inc
+@@ -20,7 +20,10 @@
+ 	native cef_on_player_connect(player_id, const ip[]);
+ 	native cef_on_player_disconnect(player_id);
+ 	native cef_emit_event(player_id, const event[], {CEF_ValueType, Float, _}:...);
+-	native cef_subscribe(const event[], const callback[]);
++	native cef_lr_protocol_version();
++	native cef_bind_game_connection(player_id, const token[]);
++	native cef_subscribe_browser(const event[], const callback[]);
++	native cef_emit_browser_event(player_id, browser_id, const event[], {CEF_ValueType, Float, _}:...);
+ 	native cef_hide_browser(player_id, browser_id, bool:hide);
+ 	native cef_create_ext_browser(player_id, browser_id, const texture[], const url[], scale);
+ 	native cef_append_to_object(player_id, browser_id, object_id);
+@@ -33,7 +36,7 @@
+ 	native cef_load_url(player_id, browser_id, const url[]);
+ 
+ 	forward OnCefInitialize(player_id, success);
+-	forward OnCefBrowserCreated(player_id, browser_id, status_code);
++	forward OnCefBrowserCreatedScoped(player_id, browser_id, browser_generation, status_code);
+ 
+ 	public OnPlayerConnect(playerid)
+ 	{
+diff --git a/server/src/lib.rs b/server/src/lib.rs
+--- a/server/src/lib.rs
++++ b/server/src/lib.rs
+@@ -76,10 +76,7 @@
+         &mut self, _: &Amx, player_id: i32, browser_id: i32, url: AmxString, hidden: bool,
+         focused: bool,
+     ) -> AmxResult<bool> {
+-        self.core
+-            .create_browser(player_id, browser_id, url.to_string(), hidden, focused);
+-
+-        Ok(true)
++        Ok(self.core.create_browser(player_id, browser_id, url.to_string(), hidden, focused))
+     }
+ 
+     #[native(name = "cef_destroy_browser")]
+@@ -104,61 +101,38 @@
+         Ok(true)
+     }
+ 
++    #[native(name = "cef_lr_protocol_version")]
++    fn protocol_version(&mut self, _: &Amx) -> AmxResult<i32> { Ok(1) }
++
++    #[native(name = "cef_bind_game_connection")]
++    fn bind_game_connection(&mut self, _: &Amx, player_id: i32, token: AmxString) -> AmxResult<bool> {
++        Ok(self.core.bind_game_connection(player_id, &token.to_string()))
++    }
++
+     #[native(name = "cef_emit_event", raw)]
+-    fn emit_event(&mut self, _: &Amx, args: Args) -> AmxResult<bool> {
+-        if args.count() < 2 || !(args.count() - 2).is_multiple_of(2) {
+-            info!("cef_emit_event invalid count of arguments");
+-            return Ok(false);
+-        }
+-
+-        let mut arguments = Vec::with_capacity((args.count() - 2) / 2);
+-
+-        let player_id = args.get::<i32>(0).unwrap();
+-        let event_name = args.get::<AmxString>(1).unwrap().to_string();
+-
+-        let mut idx = 2;
+-
+-        loop {
+-            if idx >= args.count() {
+-                break;
+-            }
+-
+-            if let Some(ty) = args.get::<Ref<i32>>(idx) {
+-                idx += 1;
+-
+-                let arg = match *ty {
+-                    0 => EventValue {
+-                        string_value: Some(args.get::<AmxString>(idx).unwrap().to_string().into()),
+-                        float_value: None,
+-                        integer_value: None,
+-                    },
+-
+-                    1 => EventValue {
+-                        string_value: None,
+-                        float_value: None,
+-                        integer_value: Some(*args.get::<Ref<i32>>(idx).unwrap()),
+-                    },
+-
+-                    2 => EventValue {
+-                        string_value: None,
+-                        float_value: Some(*args.get::<Ref<f32>>(idx).unwrap()),
+-                        integer_value: None,
+-                    },
+-
+-                    _ => break,
+-                };
+-
+-                arguments.push(arg);
+-
+-                idx += 1;
+-            } else {
+-                break;
+-            }
+-        }
+-
+-        self.core.emit_event(player_id, &event_name, arguments);
+-
+-        Ok(true)
++    fn emit_event(&mut self, _: &Amx, _args: Args) -> AmxResult<bool> { Ok(false) }
++
++    #[native(name = "cef_emit_browser_event", raw)]
++    fn emit_browser_event(&mut self, _: &Amx, args: Args) -> AmxResult<bool> {
++        self.emit_browser_event_impl(args)
++    }
++
++    fn emit_browser_event_impl(&mut self, args: Args) -> AmxResult<bool> {
++        if args.count() < 3 || !(args.count() - 3).is_multiple_of(2) || args.count() > 67 { return Ok(false); }
++        let (Some(player_id), Some(browser_id), Some(event)) = (args.get::<i32>(0), args.get::<u32>(1), args.get::<AmxString>(2)) else { return Ok(false); };
++        let mut arguments = Vec::new();
++        let mut idx = 3;
++        while idx < args.count() {
++            let Some(ty) = args.get::<Ref<i32>>(idx) else { return Ok(false); };
++            let arg = match *ty {
++                0 => { let Some(v) = args.get::<AmxString>(idx + 1) else { return Ok(false); }; EventValue { string_value: Some(v.to_string().into()), float_value: None, integer_value: None } },
++                1 => { let Some(v) = args.get::<Ref<i32>>(idx + 1) else { return Ok(false); }; EventValue { string_value: None, float_value: None, integer_value: Some(*v) } },
++                2 => { let Some(v) = args.get::<Ref<f32>>(idx + 1) else { return Ok(false); }; if !v.is_finite() { return Ok(false); } EventValue { string_value: None, float_value: Some(*v), integer_value: None } },
++                _ => return Ok(false),
++            };
++            arguments.push(arg); idx += 2;
++        }
++        Ok(self.core.emit_browser_event(player_id, browser_id, &event.to_string(), arguments))
+     }
+ 
+     #[native(name = "cef_always_listen_keys")]
+@@ -169,7 +143,7 @@
+         Ok(true)
+     }
+ 
+-    #[native(name = "cef_subscribe")]
++    #[native(name = "cef_subscribe_browser")]
+     fn subscribe(
+         &mut self, amx: &Amx, event_name: AmxString, callback: AmxString,
+     ) -> AmxResult<bool> {
+@@ -193,13 +167,8 @@
+         &mut self, _: &Amx, player_id: i32, browser_id: i32, texture: AmxString, url: AmxString,
+         scale: i32,
+     ) -> AmxResult<bool> {
+-        let texture = texture.to_string();
+-        let url = url.to_string();
+-
+-        self.core
+-            .create_external_browser(player_id, browser_id, texture, url, scale);
+-
+-        Ok(true)
++        let _ = (player_id, browser_id, texture, url, scale);
++        Ok(false)
+     }
+ 
+     #[native(name = "cef_append_to_object")]
+@@ -241,8 +210,8 @@
+     fn load_url(
+         &mut self, _: &Amx, player_id: i32, browser_id: u32, url: AmxString,
+     ) -> AmxResult<bool> {
+-        self.core.load_url(player_id, browser_id, url.to_string());
+-        Ok(true)
++        let _ = (player_id, browser_id, url);
++        Ok(false)
+     }
+ 
+     fn notify_connect(&self, player_id: i32, success: bool) {
+@@ -254,10 +223,10 @@
+         });
+     }
+ 
+-    fn notify_browser_created(&self, player_id: i32, browser_id: u32, code: i32) {
++    fn notify_browser_created(&self, player_id: i32, browser_id: u32, browser_generation: u32, code: i32) {
+         self.amx_list.iter().for_each(|&ident| {
+             samp::amx::get(ident)
+-                .map(|amx| exec_public!(amx, "OnCefBrowserCreated", player_id, browser_id, code));
++                .map(|amx| exec_public!(amx, "OnCefBrowserCreatedScoped", player_id, browser_id, browser_generation, code));
+         });
+     }
+ }
+@@ -273,6 +242,7 @@
+ 
+     fn on_amx_unload(&mut self, amx: &Amx) {
+         let ident = amx.ident();
++        self.events.retain(|_, (owner, _)| *owner != ident);
+ 
+         if let Some(position) = self.amx_list.iter().position(|&id| id == ident) {
+             self.amx_list.remove(position);
+@@ -280,10 +250,13 @@
+     }
+ 
+     fn process_tick(&mut self) {
+-        while let Some(event) = self.core.poll_event() {
++        for _ in 0..32 {
++            let Some(event) = self.core.poll_event() else { break; };
+             match event {
+                 CoreEvent::EmitEvent {
+                     player_id,
++                    browser_id,
++                    browser_generation,
+                     event,
+                     arguments,
+                 } => {
+@@ -291,7 +264,7 @@
+ 
+                     if let Some((ident, cb)) = self.events.get(&event) {
+                         samp::amx::get(*ident)
+-                            .map(|amx| exec_public!(amx, cb, player_id, &arguments => string));
++                            .map(|amx| exec_public!(amx, cb, player_id, browser_id, browser_generation, &arguments => string));
+                     }
+                 }
+ 
+@@ -306,10 +279,11 @@
+                 CoreEvent::BrowserCreated {
+                     player_id,
+                     browser_id,
++                    browser_generation,
+                     code,
+                 } => {
+                     trace!("process_tick::BrowserCreated({})", player_id);
+-                    self.notify_browser_created(player_id, browser_id, code);
++                    self.notify_browser_created(player_id, browser_id, browser_generation, code);
+                 }
+             }
+         }
+@@ -323,6 +297,9 @@
+         CefPlugin::create_browser,
+         CefPlugin::destroy_browser,
+         CefPlugin::emit_event,
++        CefPlugin::emit_browser_event,
++        CefPlugin::protocol_version,
++        CefPlugin::bind_game_connection,
+         CefPlugin::subscribe,
+         CefPlugin::block_input,
+         CefPlugin::hide_browser,
+@@ -337,7 +314,7 @@
+     ],
+     {
+         samp::plugin::enable_process_tick();
+-        samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1251);
++        samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1252);
+         let _ = samp::plugin::logger();
+         let (log_level, invalid_log_level) = server_log_level();
+         let filter = Targets::new()
+@@ -364,3 +341,6 @@
+         CefPlugin::new()
+     }
+ );
++
++#[cfg(test)]
++mod wire_amx_tests;
+diff --git a/server/src/wire_amx_tests.rs b/server/src/wire_amx_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/server/src/wire_amx_tests.rs
+@@ -0,0 +1,73 @@
++use samp::cell::{AmxCell, AmxString, Buffer, Ref, string::put_in_buffer};
++use quick_protobuf::{serialize_into_vec, deserialize_from_slice};
++
++#[test]
++fn protobuf_json_to_actual_sdk_amx_cells_preserves_cp1252_and_json_escapes() {
++    samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1252);
++    let cases = [
++        "{\"text\":\"Gr\u{00fc}\u{00df}e: \u{00e4}\u{00f6}\u{00fc}\u{00c4}\u{00d6}\u{00dc}\u{00df} \u{20ac}\",\"path\":\"C:\\\\Haus\",\"quote\":\"\\\"Fenster\\\"\"}",
++        r#"{"text":"Gr\u00fc\u00dfe: \u00e4\u00f6\u00fc\u00c4\u00d6\u00dc\u00df \u20ac","path":"C:\\Haus","quote":"\"Fenster\""}"#,
++    ];
++    let mut fixtures = Vec::new();
++    for json in cases {
++        let packet = messages::packets::EmitEvent {
++            event_name: "lr:test:encoding".into(), args: Some(json.into()), arguments: Vec::new(),
++            browser_id: Some(62404), browser_generation: Some(42),
++        };
++        let wire = serialize_into_vec(&packet).unwrap();
++        let received: messages::packets::EmitEvent = deserialize_from_slice(&wire).unwrap();
++        let json_after_wire = received.args.unwrap();
++        assert_eq!(json_after_wire, json, "Protobuf must preserve the single string exactly");
++        let mut cells = vec![0x7fffffff; 1024];
++        {
++            // Real pinned samp-sdk AMX encoder; storage is an isolated 32-bit cell array.
++            let reference = unsafe { Ref::new(0, cells.as_mut_ptr()) };
++            let mut buffer = Buffer::new(reference, cells.len());
++            put_in_buffer(&mut buffer, &json_after_wire).unwrap();
++        }
++        let bytes: Vec<u8> = cells.iter().take_while(|c| **c != 0).map(|c| {
++            assert!((0..=255).contains(c)); *c as u8
++        }).collect();
++        let (decoded, _, errors) = samp::encoding::WINDOWS_1252.decode(&bytes);
++        assert!(!errors);
++        assert_eq!(decoded, json, "No extra quoting or escape rewriting at AMX boundary");
++        let parsed: serde_json::Value = serde_json::from_str(&decoded).unwrap();
++        assert_eq!(parsed["text"], "Gr\u{00fc}\u{00df}e: \u{00e4}\u{00f6}\u{00fc}\u{00c4}\u{00d6}\u{00dc}\u{00df} \u{20ac}");
++        assert_eq!(parsed["path"], r"C:\Haus");
++        assert_eq!(parsed["quote"], "\"Fenster\"");
++        // Exercise the actual native-argument decoder over real AMX-layout cells,
++        // then the typed outbound protobuf path used by cef_emit_browser_event.
++        let mut header: samp::raw::types::AMX_HEADER = unsafe { std::mem::zeroed() };
++        extern "C" fn callback(_: *mut samp::raw::types::AMX, _: i32, _: *mut i32, _: *mut i32) -> i32 { unreachable!() }
++        extern "C" fn debug(_: *mut samp::raw::types::AMX) -> i32 { unreachable!() }
++        let mut raw = samp::raw::types::AMX {
++            base: std::ptr::null_mut(), data: std::ptr::null_mut(), callback, debug,
++            cip: 0, frm: 0, hea: 0, hlw: 0, stk: 0, stp: 0, flags: 0,
++            usertags: [0; 4], userdata: [std::ptr::null_mut(); 4], error: 0,
++            paramcount: 0, pri: 0, alt: 0, reset_stk: 0, reset_hea: 0, sysreq_d: 0,
++        };
++        raw.base = (&mut header as *mut samp::raw::types::AMX_HEADER).cast();
++        raw.data = cells.as_mut_ptr().cast();
++        raw.hea = (cells.len() * 4) as i32; raw.stk = raw.hea; raw.stp = raw.hea;
++        let amx = samp::amx::Amx::new(&mut raw, 0);
++        let argument = AmxString::from_raw(&amx, 0).unwrap().to_string();
++        assert_eq!(argument, json, "Actual AMX input decoder must use Windows-1252");
++        let outbound = messages::packets::EmitEvent {
++            event_name: "lr:house:state".into(), args: None,
++            arguments: vec![messages::packets::EventValue { string_value: Some(argument.into()), integer_value: None, float_value: None }],
++            browser_id: Some(62404), browser_generation: Some(42),
++        };
++        let wire = serialize_into_vec(&outbound).unwrap();
++        let delivered: messages::packets::EmitEvent = deserialize_from_slice(&wire).unwrap();
++        let ui_json = delivered.arguments[0].string_value.as_ref().unwrap();
++        assert_eq!(ui_json, json, "CP1252 AMX -> UTF-8 protobuf JSON must be lossless");
++        let ui_value: serde_json::Value = serde_json::from_str(ui_json).unwrap();
++        assert_eq!(ui_value, parsed);
++        fixtures.push(serde_json::json!({ "utf8_json": json, "amx_bytes": bytes, "browser_id": 62404, "browser_generation": 42 }));
++    }
++    assert!(fixtures[0]["amx_bytes"].as_array().unwrap().iter().any(|n| n.as_u64() == Some(252)));
++    assert!(fixtures[1]["amx_bytes"].as_array().unwrap().iter().all(|n| n.as_u64().unwrap() < 128));
++    if let Some(path) = std::env::var_os("SAMP_CEF_AMX_FIXTURE_OUTPUT") {
++        std::fs::write(path, serde_json::to_vec_pretty(&fixtures).unwrap()).unwrap();
++    }
++}

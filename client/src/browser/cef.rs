@@ -93,10 +93,8 @@ impl App for DefaultApp {
         command_line.append_switch("disable-gpu");
         command_line.append_switch("enable-begin-frame-scheduling");
         command_line.append_switch_with_value("autoplay-policy", "no-user-gesture-required");
-        command_line.append_switch("ignore-certificate-errors");
 
-        // TODO: permissions
-        command_line.append_switch("enable-media-stream");
+        // The LR bridge uses packaged assets and needs no device permissions.
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -179,9 +177,10 @@ pub fn create_browser(client: Arc<WebClient>, url: &str) {
     settings.webgl = cef_sys::cef_state_t::STATE_ENABLED;
     settings.javascript = cef_sys::cef_state_t::STATE_ENABLED;
 
-    let client = WebClientRef::from(client);
+    let client_ref = WebClientRef::from(client.clone());
     let result =
-        cef::browser::BrowserHost::create_browser(&window_info, Some(client), &url, &settings);
+        cef::browser::BrowserHost::create_browser(&window_info, Some(client_ref), &url, &settings);
+    if result == 0 { client.notify_creation_error(-1); }
 
     tracing::debug!(accepted = result, "CEF browser creation submitted");
 }

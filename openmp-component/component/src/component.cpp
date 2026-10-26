@@ -5,15 +5,18 @@
 #endif
 
 #if SAMP_CEF_HAS_GRPC_EXT
+#error "LR protocol 1 does not support the unscoped gRPC API"
 #include <omp_ext/component.hpp>
 #endif
 
 #include <Server/Components/Pawn/pawn.hpp>
 #include <amx/amx.h>
 #include <sdk.hpp>
+#include "pawn_callback_guard.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <optional>
 #include <set>
 #include <string>
@@ -383,7 +386,9 @@ public:
 			return;
 		}
 
-		for (;;)
+		// A network producer must never keep the game main thread in this loop.
+		// Remaining callbacks are handled by the next server tick.
+		for (unsigned int dispatched = 0; dispatched < 32; ++dispatched)
 		{
 			ServerEvent event = (*server_)->poll_event();
 			if (event.kind == EventKind::None)
@@ -424,8 +429,10 @@ public:
 			{ "cef_on_player_disconnect", &CefComponent::nativeOnPlayerDisconnect },
 			{ "cef_create_browser", &CefComponent::nativeCreateBrowser },
 			{ "cef_destroy_browser", &CefComponent::nativeDestroyBrowser },
-			{ "cef_emit_event", &CefComponent::nativeEmitEvent },
-			{ "cef_subscribe", &CefComponent::nativeSubscribe },
+			{ "cef_lr_protocol_version", &CefComponent::nativeProtocolVersion },
+			{ "cef_bind_game_connection", &CefComponent::nativeBindGameConnection },
+			{ "cef_emit_browser_event", &CefComponent::nativeEmitBrowserEvent },
+			{ "cef_subscribe_browser", &CefComponent::nativeSubscribeBrowser },
 			{ "cef_always_listen_keys", &CefComponent::nativeAlwaysListenKeys },
 			{ "cef_hide_browser", &CefComponent::nativeHideBrowser },
 			{ "cef_focus_browser", &CefComponent::nativeFocusBrowser },
@@ -531,7 +538,7 @@ private:
 			break;
 
 		case EventKind::BrowserCreated:
-			notifyBrowserCreated(event.player_id, event.browser_id, event.code);
+			notifyBrowserCreated(event.player_id, event.browser_id, event.browser_generation, event.code);
 			break;
 
 		case EventKind::None:
@@ -543,13 +550,18 @@ private:
 	{
 		const std::string name = toStdString(event.event);
 		auto subscription = subscriptions_.find(name);
-		const std::string arguments = toStdString(event.arguments);
+		const auto encoded = samp_cef::openmp::utf8_to_pawn(event.arguments);
+		if (encoded.empty() && !event.arguments.empty()) return;
+		const std::string arguments(encoded.begin(), encoded.end());
 		if (subscription != subscriptions_.end() && subscription->second.script)
 		{
+			PawnCallbackGuard guard(*subscription->second.script);
 			subscription->second.script->Call(
 				subscription->second.callback.c_str(),
 				DefaultReturnValue_False,
 				event.player_id,
+				static_cast<int>(event.browser_id),
+				static_cast<int>(event.browser_generation),
 				StringView(arguments.data(), arguments.length()));
 		}
 
@@ -562,6 +574,7 @@ private:
 	{
 		for (IPawnScript* script : scripts_)
 		{
+			PawnCallbackGuard guard(*script);
 			script->Call("OnCefInitialize", DefaultReturnValue_True, playerID, success ? 1 : 0);
 		}
 
@@ -573,11 +586,12 @@ private:
 #endif
 	}
 
-	void notifyBrowserCreated(int playerID, std::uint32_t browserID, int code)
+	void notifyBrowserCreated(int playerID, std::uint32_t browserID, std::uint32_t generation, int code)
 	{
 		for (IPawnScript* script : scripts_)
 		{
-			script->Call("OnCefBrowserCreated", DefaultReturnValue_True, playerID, static_cast<int>(browserID), code);
+			PawnCallbackGuard guard(*script);
+			script->Call("OnCefBrowserCreatedScoped", DefaultReturnValue_True, playerID, static_cast<int>(browserID), static_cast<int>(generation), code);
 		}
 
 #if SAMP_CEF_HAS_GRPC_EXT
@@ -603,7 +617,7 @@ private:
 		}
 
 		int length = 0;
-		if (script.StrLen(physicalAddress, &length) != AMX_ERR_NONE)
+		if (script.StrLen(physicalAddress, &length) != AMX_ERR_NONE || length < 0 || length > 65536)
 		{
 			return false;
 		}
@@ -614,7 +628,10 @@ private:
 			return false;
 		}
 
-		output.assign(buffer.data());
+		// Pawn strings are Windows-1252; never reinterpret arbitrary bytes as Rust UTF-8.
+		const auto utf8 = samp_cef::openmp::pawn_to_utf8(rust::Slice<const std::uint8_t>(
+			reinterpret_cast<const std::uint8_t*>(buffer.data()), static_cast<std::size_t>(length)));
+		output = toStdString(utf8);
 		return true;
 	}
 
@@ -1329,6 +1346,21 @@ private:
 		return instance_;
 	}
 
+	static cell AMX_NATIVE_CALL nativeProtocolVersion(AMX*, const cell* params)
+	{
+		return pawnParamCount(params) == 0 ? 1 : 0;
+	}
+
+	static cell AMX_NATIVE_CALL nativeBindGameConnection(AMX* amx, const cell* params)
+	{
+		CefComponent* self = component();
+		if (!self || !self->server_ || !(*self->server_)->is_running() || pawnParamCount(params) != 2) return 0;
+		IPawnScript* script = self->scriptFromAmx(amx);
+		std::string challenge;
+		if (!script || !self->getAmxString(*script, params[2], challenge)) return 0;
+		return (*self->server_)->bind_game_connection(static_cast<int>(params[1]), asRustStr(challenge)) ? 1 : 0;
+	}
+
 	static cell AMX_NATIVE_CALL nativeOnPlayerConnect(AMX* amx, const cell* params)
 	{
 		CefComponent* self = component();
@@ -1384,14 +1416,13 @@ private:
 			return 0;
 		}
 
-		(*self->server_)
+		return (*self->server_)
 			->create_browser(
 				static_cast<int>(params[1]),
 				static_cast<int>(params[2]),
 				asRustStr(url),
 				params[4] != 0,
-				params[5] != 0);
-		return 1;
+				params[5] != 0) ? 1 : 0;
 	}
 
 	static cell AMX_NATIVE_CALL nativeDestroyBrowser(AMX*, const cell* params)
@@ -1406,20 +1437,20 @@ private:
 		return 1;
 	}
 
-	static cell AMX_NATIVE_CALL nativeEmitEvent(AMX* amx, const cell* params)
+	static cell AMX_NATIVE_CALL nativeEmitBrowserEvent(AMX* amx, const cell* params)
 	{
 		CefComponent* self = component();
-		if (!self || !self->server_ || !self->requireParams(params, 2, "cef_emit_event"))
+		if (!self || !self->server_ || !self->requireParams(params, 3, "cef_emit_browser_event"))
 		{
 			return 0;
 		}
 
 		const int count = pawnParamCount(params);
-		if ((count - 2) % 2 != 0)
+		if ((count - 3) % 2 != 0 || count > 67 || params[2] < 0)
 		{
 			if (self->core_)
 			{
-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event has an incomplete argument pair");
+				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event has an incomplete argument pair");
 			}
 			return 0;
 		}
@@ -1429,30 +1460,30 @@ private:
 		{
 			if (self->core_)
 			{
-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not resolve the Pawn script");
+				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not resolve the Pawn script");
 			}
 			return 0;
 		}
 
 		std::string eventName;
-		if (!self->getAmxString(*script, params[2], eventName))
+		if (!self->getAmxString(*script, params[3], eventName))
 		{
 			if (self->core_)
 			{
-				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read the event name");
+				self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read the event name");
 			}
 			return 0;
 		}
 
 		auto arguments = samp_cef::openmp::new_event_arguments();
-		for (int idx = 3; idx <= count; idx += 2)
+		for (int idx = 4; idx <= count; idx += 2)
 		{
 			cell typeValue = 0;
 			if (!self->getAmxCell(*script, params[idx], typeValue))
 			{
 				if (self->core_)
 				{
-					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read argument type at index %d", idx);
+					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read argument type at index %d", idx);
 				}
 				return 0;
 			}
@@ -1469,7 +1500,7 @@ private:
 				{
 					if (self->core_)
 					{
-						self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event could not read string argument at index %d", idx);
+						self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event could not read string argument at index %d", idx);
 					}
 					return 0;
 				}
@@ -1495,27 +1526,28 @@ private:
 				{
 					return 0;
 				}
-				arguments->push_float(amx_ctof(floatValue));
+				const float number = amx_ctof(floatValue);
+				if (!std::isfinite(number)) return 0;
+				arguments->push_float(number);
 				break;
 			}
 
 			default:
 				if (self->core_)
 				{
-					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_event has invalid argument type %d at index %d", type, idx);
+					self->core_->logLn(LogLevel::Error, "[CEF] cef_emit_browser_event has invalid argument type %d at index %d", type, idx);
 				}
 				return 0;
 			}
 		}
 
-		(*self->server_)->emit_event(static_cast<int>(params[1]), asRustStr(eventName), *arguments);
-		return 1;
+		return (*self->server_)->emit_browser_event(static_cast<int>(params[1]), static_cast<std::uint32_t>(params[2]), asRustStr(eventName), *arguments) ? 1 : 0;
 	}
 
-	static cell AMX_NATIVE_CALL nativeSubscribe(AMX* amx, const cell* params)
+	static cell AMX_NATIVE_CALL nativeSubscribeBrowser(AMX* amx, const cell* params)
 	{
 		CefComponent* self = component();
-		if (!self || !self->requireParams(params, 2, "cef_subscribe"))
+		if (!self || !self->server_ || !(*self->server_)->is_running() || pawnParamCount(params) != 2)
 		{
 			return 0;
 		}
@@ -1533,6 +1565,9 @@ private:
 			return 0;
 		}
 
+		if (eventName.empty() || eventName.size() > 64 || callback.empty() || callback.size() > 64
+			|| !std::all_of(eventName.begin(), eventName.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == ':' || c == '.'; })
+			|| !std::all_of(callback.begin(), callback.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; })) return 0;
 		self->subscriptions_[eventName] = Subscription { script, callback };
 		return 1;
 	}
@@ -1585,35 +1620,10 @@ private:
 		return (*self->server_)->has_plugin(static_cast<int>(params[1])) ? 1 : 0;
 	}
 
-	static cell AMX_NATIVE_CALL nativeCreateExternalBrowser(AMX* amx, const cell* params)
+	static cell AMX_NATIVE_CALL nativeCreateExternalBrowser(AMX*, const cell*)
 	{
-		CefComponent* self = component();
-		if (!self || !self->server_ || !self->requireParams(params, 5, "cef_create_ext_browser"))
-		{
-			return 0;
-		}
-
-		IPawnScript* script = self->scriptFromAmx(amx);
-		if (!script)
-		{
-			return 0;
-		}
-
-		std::string texture;
-		std::string url;
-		if (!self->getAmxString(*script, params[3], texture) || !self->getAmxString(*script, params[4], url))
-		{
-			return 0;
-		}
-
-		(*self->server_)
-			->create_external_browser(
-				static_cast<int>(params[1]),
-				static_cast<int>(params[2]),
-				asRustStr(texture),
-				asRustStr(url),
-				static_cast<int>(params[5]));
-		return 1;
+		// Fresh browser generations require destroy/create in protocol 1.
+		return 0;
 	}
 
 	static cell AMX_NATIVE_CALL nativeAppendToObject(AMX*, const cell* params)
@@ -1671,29 +1681,12 @@ private:
 		return 1;
 	}
 
-	static cell AMX_NATIVE_CALL nativeLoadUrl(AMX* amx, const cell* params)
+	static cell AMX_NATIVE_CALL nativeLoadUrl(AMX*, const cell*)
 	{
-		CefComponent* self = component();
-		if (!self || !self->server_ || !self->requireParams(params, 3, "cef_load_url"))
-		{
-			return 0;
-		}
-
-		IPawnScript* script = self->scriptFromAmx(amx);
-		if (!script)
-		{
-			return 0;
-		}
-
-		std::string url;
-		if (!self->getAmxString(*script, params[3], url))
-		{
-			return 0;
-		}
-
-		(*self->server_)->load_url(static_cast<int>(params[1]), static_cast<std::uint32_t>(params[2]), asRustStr(url));
-		return 1;
+		// Fresh browser generations require destroy/create in protocol 1.
+		return 0;
 	}
+
 };
 
 CefComponent* CefComponent::instance_ = nullptr;

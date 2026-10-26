@@ -198,6 +198,7 @@ pub struct CreateBrowser<'a> {
     pub url: Cow<'a, str>,
     pub hidden: bool,
     pub focused: bool,
+    pub browser_generation: u32,
 }
 
 impl<'a> MessageRead<'a> for CreateBrowser<'a> {
@@ -209,6 +210,7 @@ impl<'a> MessageRead<'a> for CreateBrowser<'a> {
                 Ok(18) => msg.url = r.read_string(bytes).map(Cow::Borrowed)?,
                 Ok(24) => msg.hidden = r.read_bool(bytes)?,
                 Ok(32) => msg.focused = r.read_bool(bytes)?,
+                Ok(40) => msg.browser_generation = r.read_uint32(bytes)?,
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -220,6 +222,7 @@ impl<'a> MessageRead<'a> for CreateBrowser<'a> {
 impl<'a> MessageWrite for CreateBrowser<'a> {
     fn get_size(&self) -> usize {
         0
+        + 1 + sizeof_varint(self.browser_generation as u64)
         + 1 + sizeof_varint(*(&self.browser_id) as u64)
         + 1 + sizeof_len((&self.url).len())
         + 1 + sizeof_varint(*(&self.hidden) as u64)
@@ -231,6 +234,7 @@ impl<'a> MessageWrite for CreateBrowser<'a> {
         w.write_with_tag(18, |w| w.write_string(&**&self.url))?;
         w.write_with_tag(24, |w| w.write_bool(*&self.hidden))?;
         w.write_with_tag(32, |w| w.write_bool(*&self.focused))?;
+        w.write_with_tag(40, |w| w.write_uint32(self.browser_generation))?;
         Ok(())
     }
 }
@@ -306,6 +310,8 @@ pub struct EmitEvent<'a> {
     pub event_name: Cow<'a, str>,
     pub args: Option<Cow<'a, str>>,
     pub arguments: Vec<EventValue<'a>>,
+    pub browser_id: Option<u32>,
+    pub browser_generation: Option<u32>,
 }
 
 impl<'a> MessageRead<'a> for EmitEvent<'a> {
@@ -316,6 +322,8 @@ impl<'a> MessageRead<'a> for EmitEvent<'a> {
                 Ok(10) => msg.event_name = r.read_string(bytes).map(Cow::Borrowed)?,
                 Ok(18) => msg.args = Some(r.read_string(bytes).map(Cow::Borrowed)?),
                 Ok(26) => msg.arguments.push(r.read_message::<EventValue>(bytes)?),
+                Ok(32) => msg.browser_id = Some(r.read_uint32(bytes)?),
+                Ok(40) => msg.browser_generation = Some(r.read_uint32(bytes)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -327,6 +335,8 @@ impl<'a> MessageRead<'a> for EmitEvent<'a> {
 impl<'a> MessageWrite for EmitEvent<'a> {
     fn get_size(&self) -> usize {
         0
+        + self.browser_generation.as_ref().map_or(0, |m| 1 + sizeof_varint(*m as u64))
+        + self.browser_id.as_ref().map_or(0, |m| 1 + sizeof_varint(*m as u64))
         + 1 + sizeof_len((&self.event_name).len())
         + self.args.as_ref().map_or(0, |m| 1 + sizeof_len((m).len()))
         + self.arguments.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
@@ -336,6 +346,8 @@ impl<'a> MessageWrite for EmitEvent<'a> {
         w.write_with_tag(10, |w| w.write_string(&**&self.event_name))?;
         if let Some(ref s) = self.args { w.write_with_tag(18, |w| w.write_string(&**s))?; }
         for s in &self.arguments { w.write_with_tag(26, |w| w.write_message(s))?; }
+        if let Some(v) = self.browser_id { w.write_with_tag(32, |w| w.write_uint32(v))?; }
+        if let Some(v) = self.browser_generation { w.write_with_tag(40, |w| w.write_uint32(v))?; }
         Ok(())
     }
 }
@@ -453,6 +465,7 @@ impl<'a> MessageWrite for EventValue<'a> {
 pub struct BrowserCreated {
     pub browser_id: u32,
     pub status_code: i32,
+    pub browser_generation: u32,
 }
 
 impl<'a> MessageRead<'a> for BrowserCreated {
@@ -462,6 +475,7 @@ impl<'a> MessageRead<'a> for BrowserCreated {
             match r.next_tag(bytes) {
                 Ok(8) => msg.browser_id = r.read_uint32(bytes)?,
                 Ok(16) => msg.status_code = r.read_int32(bytes)?,
+                Ok(24) => msg.browser_generation = r.read_uint32(bytes)?,
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -473,6 +487,7 @@ impl<'a> MessageRead<'a> for BrowserCreated {
 impl MessageWrite for BrowserCreated {
     fn get_size(&self) -> usize {
         0
+        + 1 + sizeof_varint(self.browser_generation as u64)
         + 1 + sizeof_varint(*(&self.browser_id) as u64)
         + 1 + sizeof_varint(*(&self.status_code) as u64)
     }
@@ -480,6 +495,7 @@ impl MessageWrite for BrowserCreated {
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
         w.write_with_tag(8, |w| w.write_uint32(*&self.browser_id))?;
         w.write_with_tag(16, |w| w.write_int32(*&self.status_code))?;
+        w.write_with_tag(24, |w| w.write_uint32(self.browser_generation))?;
         Ok(())
     }
 }
@@ -497,16 +513,26 @@ impl<'a> MessageRead<'a> for Got {
 impl MessageWrite for Got { }
 
 #[derive(Debug, Default, PartialEq, Clone)]
-pub struct OpenConnection { }
-
-impl<'a> MessageRead<'a> for OpenConnection {
-    fn from_reader(r: &mut BytesReader, _: &[u8]) -> Result<Self> {
-        r.read_to_end();
-        Ok(Self::default())
+pub struct OpenConnection<'a> { pub bind_token: Cow<'a, str> }
+impl<'a> MessageRead<'a> for OpenConnection<'a> {
+    fn from_reader(r: &mut BytesReader, bytes: &'a [u8]) -> Result<Self> {
+        let mut msg = Self::default();
+        while !r.is_eof() {
+            match r.next_tag(bytes) {
+                Ok(10) => msg.bind_token = r.read_string(bytes).map(Cow::Borrowed)?,
+                Ok(t) => { r.read_unknown(bytes, t)?; }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(msg)
     }
 }
-
-impl MessageWrite for OpenConnection { }
+impl<'a> MessageWrite for OpenConnection<'a> {
+    fn get_size(&self) -> usize { 1 + sizeof_len(self.bind_token.len()) }
+    fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
+        w.write_with_tag(10, |w| w.write_string(&self.bind_token))?; Ok(())
+    }
+}
 
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct CreateExternalBrowser<'a> {

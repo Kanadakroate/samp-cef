@@ -24,6 +24,8 @@ pub mod network;
 pub mod render;
 pub mod static_cell;
 pub mod utils;
+mod text_encoding;
+mod game_command;
 
 // TODO: Сделать человеческие модули звука
 

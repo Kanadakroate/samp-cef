@@ -255,6 +255,7 @@ dependencies = [
  "cef-server-core",
  "cxx",
  "cxx-build",
+ "encoding_rs",
  "tracing",
  "tracing-subscriber",
 ]
@@ -272,8 +273,11 @@ dependencies = [
 name = "cef-server"
 version = "0.1.0"
 dependencies = [
+ "cef-messages",
  "cef-server-core",
+ "quick-protobuf",
  "samp",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -285,6 +289,7 @@ dependencies = [
  "cef-messages",
  "cef-network",
  "crossbeam-channel",
+ "getrandom 0.2.17",
  "quick-protobuf",
  "tracing",
 ]

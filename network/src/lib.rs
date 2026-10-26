@@ -17,11 +17,10 @@ new_key_type! {
     pub struct PeerId;
 }
 
-const INCOMING_PACKET_SIZE: usize = 10 * 1024 * 1024; // 10Mb
+const INCOMING_PACKET_SIZE: usize = 64 * 1024; // bounded native wire envelope
 
 pub enum CertStrategy {
-    // LetsEncrypt(String),
-    SelfSigned,
+    FromFiles,
 }
 
 pub enum Event {
@@ -36,7 +35,7 @@ enum WorkerEvent {
     Connected(
         Connection,
         oneshot::Sender<PeerId>,
-        Sender<Vec<u8>>,
+        mpsc::Sender<Vec<u8>>,
         Option<PeerId>,
     ),
     Message(PeerId, Vec<u8>),
@@ -52,7 +51,7 @@ enum Command {
 
 struct ActiveConnection {
     connection: Connection,
-    msg_tx: Sender<Vec<u8>>,
+    msg_tx: mpsc::Sender<Vec<u8>>,
 }
 
 pub struct Socket {
@@ -68,7 +67,7 @@ impl Socket {
         let runtime = Runtime::new()?;
         let _guard = runtime.enter();
 
-        let endpoint = client::make_insecure_client(addr)?;
+        let endpoint = client::make_pinned_client(addr)?;
 
         Ok(Self::setup(runtime, endpoint, false))
     }
@@ -77,13 +76,13 @@ impl Socket {
         let runtime = Runtime::new()?;
         let _guard = runtime.enter();
 
-        let endpoint = server::make_self_signed(addr)?;
+        let endpoint = server::make_from_files(addr)?;
 
         Ok(Self::setup(runtime, endpoint, true))
     }
 
     fn setup(runtime: Runtime, endpoint: Endpoint, is_listening: bool) -> Self {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(1024);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         runtime.spawn(worker_task(endpoint, cmd_rx, event_tx, is_listening));
@@ -113,7 +112,9 @@ impl Socket {
 
     pub fn send_message(&self, peer_id: PeerId, message: Vec<u8>) {
         if let Some(peer) = self.peers.get(peer_id) {
-            let _ = peer.msg_tx.send(message);
+            if peer.msg_tx.try_send(message).is_err() {
+                peer.connection.close(0u32.into(), b"outbound queue full");
+            }
         }
     }
 
@@ -156,19 +157,6 @@ impl Socket {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn server_socket_starts_without_an_external_async_runtime() {
-        let address = "127.0.0.1:0".parse().unwrap();
-        let socket = Socket::new_server(address, CertStrategy::SelfSigned);
-
-        assert!(socket.is_ok(), "server socket failed: {:?}", socket.err());
-    }
-}
-
 impl Drop for Socket {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(Command::Close);
@@ -194,7 +182,7 @@ async fn worker_task(
                     ));
                 }
                 Err(_) => {
-                    let _ = event_tx.send(WorkerEvent::ConnectionError(peer_id));
+                    let _ = event_tx.try_send(WorkerEvent::ConnectionError(peer_id));
                 }
             },
 
@@ -207,9 +195,12 @@ async fn worker_task(
 }
 
 async fn accept_connections(endpoint: Endpoint, event_tx: crossbeam_channel::Sender<WorkerEvent>) {
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(permit) = limit.clone().try_acquire_owned() else { incoming.refuse(); continue; };
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Ok(connecting) = incoming.accept() {
                 let _ = process_connection(connecting, event_tx, None).await;
             }
@@ -225,14 +216,14 @@ async fn process_connection(
         Ok(conn) => conn,
         Err(_) => {
             if let Some(peer_id) = peer_id {
-                let _ = event_tx.send(WorkerEvent::ConnectionError(peer_id));
+                let _ = event_tx.try_send(WorkerEvent::ConnectionError(peer_id));
             }
 
             return Ok(());
         }
     };
 
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let (msg_tx, mut msg_rx) = mpsc::channel(128);
 
     let peer_id =
         notify_about_incoming(event_tx.clone(), connection.clone(), msg_tx, peer_id).await?;
@@ -251,10 +242,10 @@ async fn process_connection(
 
 async fn notify_about_incoming(
     event_tx: crossbeam_channel::Sender<WorkerEvent>, connection: Connection,
-    msg_tx: Sender<Vec<u8>>, peer_id: Option<PeerId>,
+    msg_tx: mpsc::Sender<Vec<u8>>, peer_id: Option<PeerId>,
 ) -> anyhow::Result<PeerId> {
     let (tx, rx) = oneshot::channel();
-    event_tx.send(WorkerEvent::Connected(connection, tx, msg_tx, peer_id))?;
+    event_tx.try_send(WorkerEvent::Connected(connection, tx, msg_tx, peer_id))?;
 
     Ok(rx.await?)
 }
@@ -264,11 +255,21 @@ async fn listen_to_streams(
 ) {
     while let Ok(mut stream) = connection.accept_uni().await {
         if let Ok(bytes) = stream.read_to_end(INCOMING_PACKET_SIZE).await
-            && event_tx.send(WorkerEvent::Message(peer_id, bytes)).is_err()
+            && event_tx.try_send(WorkerEvent::Message(peer_id, bytes)).is_err()
         {
+            connection.close(0u32.into(), b"event queue full");
             break;
         }
     }
 
-    let _ = event_tx.send(WorkerEvent::Disconnect(peer_id));
+    // Do not lose lifecycle cleanup when the bounded data queue is saturated.
+    // Yield between retries so runtime shutdown can cancel this task cleanly.
+    let mut event = WorkerEvent::Disconnect(peer_id);
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+            Err(crossbeam_channel::TrySendError::Full(returned)) => { event = returned; }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }

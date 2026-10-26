@@ -60,6 +60,7 @@ mod ffi {
         kind: EventKind,
         player_id: i32,
         browser_id: u32,
+        browser_generation: u32,
         code: i32,
         success: bool,
         event: String,
@@ -71,17 +72,21 @@ mod ffi {
         type EventArguments;
 
         fn create_server_core(bind: &str, port: u16) -> Box<ServerCore>;
+        fn pawn_to_utf8(bytes: &[u8]) -> String;
+        fn utf8_to_pawn(value: &str) -> Vec<u8>;
 
         fn is_running(self: &ServerCore) -> bool;
         fn last_error(self: &ServerCore) -> String;
 
         fn allow_connection(self: &mut ServerCore, player_id: i32, ip: &str) -> bool;
         fn remove_connection(self: &mut ServerCore, player_id: i32);
+        fn bind_game_connection(self: &ServerCore, player_id: i32, token: &str) -> bool;
+        fn emit_browser_event(self: &ServerCore, player_id: i32, browser_id: u32, event: &str, arguments: &EventArguments) -> bool;
 
         fn create_browser(
             self: &mut ServerCore, player_id: i32, browser_id: i32, url: &str, hidden: bool,
             focused: bool,
-        );
+        ) -> bool;
         fn destroy_browser(self: &mut ServerCore, player_id: i32, browser_id: i32);
         fn hide_browser(self: &ServerCore, player_id: i32, browser_id: i32, hide: bool);
         fn focus_browser(self: &ServerCore, player_id: i32, browser_id: i32, focused: bool);
@@ -174,12 +179,14 @@ impl ServerCore {
         }
     }
 
-    fn create_browser(
-        &mut self, player_id: i32, browser_id: i32, url: &str, hidden: bool, focused: bool,
-    ) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.create_browser(player_id, browser_id, url.to_owned(), hidden, focused);
-        }
+    fn bind_game_connection(&self, player_id: i32, token: &str) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.bind_game_connection(player_id, token))
+    }
+    fn emit_browser_event(&self, player_id: i32, browser_id: u32, event: &str, arguments: &EventArguments) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.emit_browser_event(player_id, browser_id, event, arguments.values.clone()))
+    }
+    fn create_browser(&mut self, player_id: i32, browser_id: i32, url: &str, hidden: bool, focused: bool) -> bool {
+        self.inner.as_mut().is_some_and(|inner| inner.create_browser(player_id, browser_id, url.to_owned(), hidden, focused))
     }
 
     fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
@@ -274,10 +281,14 @@ impl ServerCore {
             Some(CoreEvent::EmitEvent {
                 player_id,
                 event,
+                browser_id,
+                browser_generation,
                 arguments,
             }) => ffi::ServerEvent {
                 kind: ffi::EventKind::EmitEvent,
                 player_id,
+                browser_id,
+                browser_generation,
                 event,
                 arguments,
                 ..empty_event()
@@ -293,11 +304,13 @@ impl ServerCore {
             Some(CoreEvent::BrowserCreated {
                 player_id,
                 browser_id,
+                browser_generation,
                 code,
             }) => ffi::ServerEvent {
                 kind: ffi::EventKind::BrowserCreated,
                 player_id,
                 browser_id,
+                browser_generation,
                 code,
                 ..empty_event()
             },
@@ -342,9 +355,28 @@ fn empty_event() -> ffi::ServerEvent {
         kind: ffi::EventKind::None,
         player_id: 0,
         browser_id: 0,
+        browser_generation: 0,
         code: 0,
         success: false,
         event: String::new(),
         arguments: String::new(),
+    }
+}
+
+fn pawn_to_utf8(bytes: &[u8]) -> String { encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned() }
+fn utf8_to_pawn(value: &str) -> Vec<u8> {
+    let (bytes, _, errors) = encoding_rs::WINDOWS_1252.encode(value);
+    if errors { Vec::new() } else { bytes.into_owned() }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    #[test] fn component_cp1252_boundary_preserves_umlauts_and_json_escapes() {
+        let json = "{\"text\":\"Gr\u{00fc}\u{00df}e \u{20ac}\",\"escaped\":\"\\u00fc\"}";
+        let bytes = utf8_to_pawn(json);
+        assert!(bytes.contains(&252)); assert!(bytes.contains(&223)); assert!(bytes.contains(&128));
+        assert_eq!(pawn_to_utf8(&bytes), json);
+        assert!(utf8_to_pawn("\u{1f600}").is_empty());
     }
 }

@@ -76,10 +76,7 @@ impl CefPlugin {
         &mut self, _: &Amx, player_id: i32, browser_id: i32, url: AmxString, hidden: bool,
         focused: bool,
     ) -> AmxResult<bool> {
-        self.core
-            .create_browser(player_id, browser_id, url.to_string(), hidden, focused);
-
-        Ok(true)
+        Ok(self.core.create_browser(player_id, browser_id, url.to_string(), hidden, focused))
     }
 
     #[native(name = "cef_destroy_browser")]
@@ -104,61 +101,38 @@ impl CefPlugin {
         Ok(true)
     }
 
+    #[native(name = "cef_lr_protocol_version")]
+    fn protocol_version(&mut self, _: &Amx) -> AmxResult<i32> { Ok(1) }
+
+    #[native(name = "cef_bind_game_connection")]
+    fn bind_game_connection(&mut self, _: &Amx, player_id: i32, token: AmxString) -> AmxResult<bool> {
+        Ok(self.core.bind_game_connection(player_id, &token.to_string()))
+    }
+
     #[native(name = "cef_emit_event", raw)]
-    fn emit_event(&mut self, _: &Amx, args: Args) -> AmxResult<bool> {
-        if args.count() < 2 || !(args.count() - 2).is_multiple_of(2) {
-            info!("cef_emit_event invalid count of arguments");
-            return Ok(false);
+    fn emit_event(&mut self, _: &Amx, _args: Args) -> AmxResult<bool> { Ok(false) }
+
+    #[native(name = "cef_emit_browser_event", raw)]
+    fn emit_browser_event(&mut self, _: &Amx, args: Args) -> AmxResult<bool> {
+        self.emit_browser_event_impl(args)
+    }
+
+    fn emit_browser_event_impl(&mut self, args: Args) -> AmxResult<bool> {
+        if args.count() < 3 || !(args.count() - 3).is_multiple_of(2) || args.count() > 67 { return Ok(false); }
+        let (Some(player_id), Some(browser_id), Some(event)) = (args.get::<i32>(0), args.get::<u32>(1), args.get::<AmxString>(2)) else { return Ok(false); };
+        let mut arguments = Vec::new();
+        let mut idx = 3;
+        while idx < args.count() {
+            let Some(ty) = args.get::<Ref<i32>>(idx) else { return Ok(false); };
+            let arg = match *ty {
+                0 => { let Some(v) = args.get::<AmxString>(idx + 1) else { return Ok(false); }; EventValue { string_value: Some(v.to_string().into()), float_value: None, integer_value: None } },
+                1 => { let Some(v) = args.get::<Ref<i32>>(idx + 1) else { return Ok(false); }; EventValue { string_value: None, float_value: None, integer_value: Some(*v) } },
+                2 => { let Some(v) = args.get::<Ref<f32>>(idx + 1) else { return Ok(false); }; if !v.is_finite() { return Ok(false); } EventValue { string_value: None, float_value: Some(*v), integer_value: None } },
+                _ => return Ok(false),
+            };
+            arguments.push(arg); idx += 2;
         }
-
-        let mut arguments = Vec::with_capacity((args.count() - 2) / 2);
-
-        let player_id = args.get::<i32>(0).unwrap();
-        let event_name = args.get::<AmxString>(1).unwrap().to_string();
-
-        let mut idx = 2;
-
-        loop {
-            if idx >= args.count() {
-                break;
-            }
-
-            if let Some(ty) = args.get::<Ref<i32>>(idx) {
-                idx += 1;
-
-                let arg = match *ty {
-                    0 => EventValue {
-                        string_value: Some(args.get::<AmxString>(idx).unwrap().to_string().into()),
-                        float_value: None,
-                        integer_value: None,
-                    },
-
-                    1 => EventValue {
-                        string_value: None,
-                        float_value: None,
-                        integer_value: Some(*args.get::<Ref<i32>>(idx).unwrap()),
-                    },
-
-                    2 => EventValue {
-                        string_value: None,
-                        float_value: Some(*args.get::<Ref<f32>>(idx).unwrap()),
-                        integer_value: None,
-                    },
-
-                    _ => break,
-                };
-
-                arguments.push(arg);
-
-                idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        self.core.emit_event(player_id, &event_name, arguments);
-
-        Ok(true)
+        Ok(self.core.emit_browser_event(player_id, browser_id, &event.to_string(), arguments))
     }
 
     #[native(name = "cef_always_listen_keys")]
@@ -169,7 +143,7 @@ impl CefPlugin {
         Ok(true)
     }
 
-    #[native(name = "cef_subscribe")]
+    #[native(name = "cef_subscribe_browser")]
     fn subscribe(
         &mut self, amx: &Amx, event_name: AmxString, callback: AmxString,
     ) -> AmxResult<bool> {
@@ -193,13 +167,8 @@ impl CefPlugin {
         &mut self, _: &Amx, player_id: i32, browser_id: i32, texture: AmxString, url: AmxString,
         scale: i32,
     ) -> AmxResult<bool> {
-        let texture = texture.to_string();
-        let url = url.to_string();
-
-        self.core
-            .create_external_browser(player_id, browser_id, texture, url, scale);
-
-        Ok(true)
+        let _ = (player_id, browser_id, texture, url, scale);
+        Ok(false)
     }
 
     #[native(name = "cef_append_to_object")]
@@ -241,8 +210,8 @@ impl CefPlugin {
     fn load_url(
         &mut self, _: &Amx, player_id: i32, browser_id: u32, url: AmxString,
     ) -> AmxResult<bool> {
-        self.core.load_url(player_id, browser_id, url.to_string());
-        Ok(true)
+        let _ = (player_id, browser_id, url);
+        Ok(false)
     }
 
     fn notify_connect(&self, player_id: i32, success: bool) {
@@ -254,10 +223,10 @@ impl CefPlugin {
         });
     }
 
-    fn notify_browser_created(&self, player_id: i32, browser_id: u32, code: i32) {
+    fn notify_browser_created(&self, player_id: i32, browser_id: u32, browser_generation: u32, code: i32) {
         self.amx_list.iter().for_each(|&ident| {
             samp::amx::get(ident)
-                .map(|amx| exec_public!(amx, "OnCefBrowserCreated", player_id, browser_id, code));
+                .map(|amx| exec_public!(amx, "OnCefBrowserCreatedScoped", player_id, browser_id, browser_generation, code));
         });
     }
 }
@@ -273,6 +242,7 @@ impl SampPlugin for CefPlugin {
 
     fn on_amx_unload(&mut self, amx: &Amx) {
         let ident = amx.ident();
+        self.events.retain(|_, (owner, _)| *owner != ident);
 
         if let Some(position) = self.amx_list.iter().position(|&id| id == ident) {
             self.amx_list.remove(position);
@@ -280,10 +250,13 @@ impl SampPlugin for CefPlugin {
     }
 
     fn process_tick(&mut self) {
-        while let Some(event) = self.core.poll_event() {
+        for _ in 0..32 {
+            let Some(event) = self.core.poll_event() else { break; };
             match event {
                 CoreEvent::EmitEvent {
                     player_id,
+                    browser_id,
+                    browser_generation,
                     event,
                     arguments,
                 } => {
@@ -291,7 +264,7 @@ impl SampPlugin for CefPlugin {
 
                     if let Some((ident, cb)) = self.events.get(&event) {
                         samp::amx::get(*ident)
-                            .map(|amx| exec_public!(amx, cb, player_id, &arguments => string));
+                            .map(|amx| exec_public!(amx, cb, player_id, browser_id, browser_generation, &arguments => string));
                     }
                 }
 
@@ -306,10 +279,11 @@ impl SampPlugin for CefPlugin {
                 CoreEvent::BrowserCreated {
                     player_id,
                     browser_id,
+                    browser_generation,
                     code,
                 } => {
                     trace!("process_tick::BrowserCreated({})", player_id);
-                    self.notify_browser_created(player_id, browser_id, code);
+                    self.notify_browser_created(player_id, browser_id, browser_generation, code);
                 }
             }
         }
@@ -323,6 +297,9 @@ initialize_plugin!(
         CefPlugin::create_browser,
         CefPlugin::destroy_browser,
         CefPlugin::emit_event,
+        CefPlugin::emit_browser_event,
+        CefPlugin::protocol_version,
+        CefPlugin::bind_game_connection,
         CefPlugin::subscribe,
         CefPlugin::block_input,
         CefPlugin::hide_browser,
@@ -337,7 +314,7 @@ initialize_plugin!(
     ],
     {
         samp::plugin::enable_process_tick();
-        samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1251);
+        samp::encoding::set_default_encoding(samp::encoding::WINDOWS_1252);
         let _ = samp::plugin::logger();
         let (log_level, invalid_log_level) = server_log_level();
         let filter = Targets::new()
@@ -364,3 +341,6 @@ initialize_plugin!(
         CefPlugin::new()
     }
 );
+
+#[cfg(test)]
+mod wire_amx_tests;

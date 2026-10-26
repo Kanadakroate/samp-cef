@@ -1,0 +1,245 @@
+{
+  "format": 1,
+  "protocol": 1,
+  "upstream_repository": "https://github.com/zottce/samp-cef",
+  "upstream_revision": "f14fe4fa7f0d036edf445ba02b4bddd4cccac377",
+  "samp_client_api_revision": "d497ffad4903d9cc3f02869c744c3c3d96217cbb",
+  "samp_rs_revision": "2e9192713bf9a77ee04e0ebbcda37d078c9c47dd",
+  "openmp_runtime_release": "1.5.8.3079",
+  "openmp_revision": "c6759bd8d265171ae3d86598895a23d5a8d92a3b",
+  "openmp_sdk_revision": "efc11219c587dd1af791130bb937152051c05bda",
+  "openmp_pawn_revision": "56315596dce01a1461995cb506fd3df72ab2c8ee",
+  "patch": "lr-protocol-1.patch",
+  "patch_sha256": "527d988d88d5e74669d56be2888ec09a8dfc6de34c8c3174f6bccd9da37385a5",
+  "upstream_license_file": "UPSTREAM-LICENSE.txt",
+  "upstream_license_sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+  "source_hash_policy": "UTF-8 source bytes with CRLF normalized to LF; generated protobuf source is included",
+  "cef_distribution": {
+    "cefVersion": "150.0.11+gb887805+chromium-150.0.7871.115",
+    "chromiumVersion": "150.0.7871.115",
+    "branch": 7871,
+    "apiVersion": 15000,
+    "apiHashWindows": "71146b4350a01d3805e7ea990eb034e6ef4d53db",
+    "channel": "stable",
+    "platform": "windows32",
+    "distribution": "standard",
+    "archive": "cef_binary_150.0.11+gb887805+chromium-150.0.7871.115_windows32.tar.bz2",
+    "archiveRoot": "cef_binary_150.0.11+gb887805+chromium-150.0.7871.115_windows32",
+    "url": "https://cef-builds.spotifycdn.com/cef_binary_150.0.11%2Bgb887805%2Bchromium-150.0.7871.115_windows32.tar.bz2",
+    "size": 282303880,
+    "sha1": "419865ba13eb2dd668778ec0cfa3f02bfa389342",
+    "sha256": "03b6b34328ef943d04bbd06479b097de4046e89439ae2d6122d0e95e517a7909"
+  },
+  "changed_files": [
+    {
+      "path": "Cargo.lock",
+      "before_sha256_lf": "ce972f48e124f1add181a55cc9a6c76aefbedf823bdac1373a203942edd5347e",
+      "after_sha256_lf": "8091899d2d9799f79cf432eb0235fe70766bda0a497cf48a80ff4bb46781d9bd"
+    },
+    {
+      "path": "cef/src/browser.rs",
+      "before_sha256_lf": "db054f2978b823709dfa47da33d1f2c5443b7b344971945be93455fc729dcfc5",
+      "after_sha256_lf": "da295d0281eec897023d3e16a58c881e8772b876c5758314e018fa5f76ef4b9b"
+    },
+    {
+      "path": "cef/src/handlers/load.rs",
+      "before_sha256_lf": "9d921240063a39059d6a713edac2f41581c406f54488539142bafba180e190e2",
+      "after_sha256_lf": "c7856dc2b38a4a34a0cd6a0bbbaf74e9679491577f2aa4f3733ce37038f4cefa"
+    },
+    {
+      "path": "cef/src/lib.rs",
+      "before_sha256_lf": "c87922a7c585e9b9dfa63b0cc215a3eebb11c2a33d44b89ba7a1fa8109de7af0",
+      "after_sha256_lf": "ba62e9cde8a3bb552a498ad13f49fe6351cb224bea4a63d95eddd35c903648ac"
+    },
+    {
+      "path": "cef/src/local_policy.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "21a7c04077dab6d442bc7e525cfdc8b8084680c7147a3392870997900eaa65dd"
+    },
+    {
+      "path": "cef/src/rust_to_c/client.rs",
+      "before_sha256_lf": "e87a3c2d7acf375cb6fae669e4341de37f8aa6a9d1e12cfb1fc60a747e081688",
+      "after_sha256_lf": "94cfa1f38d80afa090e054c30341702a0f78507eca16044ff3d7f6d78fa5f3d6"
+    },
+    {
+      "path": "cef/src/rust_to_c/lifespan_handler.rs",
+      "before_sha256_lf": "9147c42986a200805e5590c2b21cb0c6ef5e95cb78026ef6dc4cd9b43a360823",
+      "after_sha256_lf": "3f319b311124470c8ffd11d1934813227c6da8dd0547f88d26e7ffeb24a28490"
+    },
+    {
+      "path": "cef/src/rust_to_c/load_handler.rs",
+      "before_sha256_lf": "1ef30e430072eb25eac70656d72ead808b13f6b9754ebdcd72b86a5842f901b1",
+      "after_sha256_lf": "09f6f701677d6854e2004374c9ae480169da8fbf35bb16f06760f8a00367987b"
+    },
+    {
+      "path": "client/src/app.rs",
+      "before_sha256_lf": "e32b28e8dcfff3e61ef0069154a0cb234de5b8442974c820fdeee5f243adce8d",
+      "after_sha256_lf": "c362de5319e4365f37a469f33437e8ac6225b24b4d9c70743bec4a808df93b10"
+    },
+    {
+      "path": "client/src/browser.rs",
+      "before_sha256_lf": "aedf314105a338ffcdfb7adf145ea863505472068a2bc48a5030fc58f11c2ab2",
+      "after_sha256_lf": "76fa77b081d8208be83cd9867d1f10f556e8d515369a1446231bd6df069d3cab"
+    },
+    {
+      "path": "client/src/browser/assets_scheme.rs",
+      "before_sha256_lf": "cf49c2485f4a140f09d40a9996901a6929b4192c3ee82d23577bc302b8b3d016",
+      "after_sha256_lf": "d6cdeffef86ebcd75df15ca7257055015cc94e145489c1a0f7db88a411a257cc"
+    },
+    {
+      "path": "client/src/browser/cef.rs",
+      "before_sha256_lf": "865bdebe232e6e6bc7759249eb8f813eeb193b2e5a72698d529b326337779d71",
+      "after_sha256_lf": "0aff0f16d395d2f8884d7b25b10f620bfc03092a6b07efc430dde19a409bbfcf"
+    },
+    {
+      "path": "client/src/browser/client.rs",
+      "before_sha256_lf": "cb3c297818c8e1fbe0d64d9a48d95265d6d87734b69766cecd707853936bc666",
+      "after_sha256_lf": "f18698da628e7b7f8b5381cfa6dea90bc8b7dd50543607056efe99cb521374d5"
+    },
+    {
+      "path": "client/src/browser/event_args.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "701f5b42e80f9a9b73d1b4538b3c6d8c2ddf5a64786a63fdeed9c07c9a907631"
+    },
+    {
+      "path": "client/src/browser/manager.rs",
+      "before_sha256_lf": "4adba0bc1f90ff08b8f7ab3be7dc565144baab334edc360a8f25b07aa4e5155c",
+      "after_sha256_lf": "cec3c4b893dbb90ca3d13dfd55d75e6e176e35867bf0cd3d7aefa855b82d1a5f"
+    },
+    {
+      "path": "client/src/browser/render_order.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "a23053b706121ea7db9c2c2e37ae1e09fe0dab011fc12c57640098ab5e032e01"
+    },
+    {
+      "path": "client/src/external.rs",
+      "before_sha256_lf": "aa62328966dd5b3a24afc8d3466b1cf3593d8764cd7babad3b81d62eb44e6b87",
+      "after_sha256_lf": "2aaae5456a376ea574417928a03f1a1db54567d3da276c5c6584081411e3bce4"
+    },
+    {
+      "path": "client/src/game_command.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "4f63bc1067735f02b97799bd20d197c2282db532d7094ad201a5282ee11bdabb"
+    },
+    {
+      "path": "client/src/lib.rs",
+      "before_sha256_lf": "a0aae6a66fe6e972a1acb2adb769405b5e6875cff949bc528d30ec67e502ed0e",
+      "after_sha256_lf": "f82aa1a363c0072c009e1921fc4c5da02e9d4a20bd946534bcbca8537ea574af"
+    },
+    {
+      "path": "client/src/network.rs",
+      "before_sha256_lf": "352ed2e8b13ed047e45c6f9c0e86aedb48c18896ac072f177683908a9defa6b4",
+      "after_sha256_lf": "5f17ef81476200f4ab169fd3ec15a79f16fa312d4bda9d0a66c9cd473f809f40"
+    },
+    {
+      "path": "client/src/text_encoding.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "df25d3c590a14eee50b6bcc671b8d189baf4c4fafe3443743fe97660e409f097"
+    },
+    {
+      "path": "messages/src/lib.rs",
+      "before_sha256_lf": "8fe2153408ccd0fdddc829767661695a1b59af685c5489e4e87ad97551f48035",
+      "after_sha256_lf": "93d6d418070c5b8118f8f7b593fb449ac985c55cc7089b0278c4cbb1f12d0e2c"
+    },
+    {
+      "path": "messages/src/packets.rs",
+      "before_sha256_lf": "a30aea59e3851c274b79f3a74e1a105255a698a7ad348a2ac71719e3e27fa5f6",
+      "after_sha256_lf": "c54bbbc0d230f99171c5f05e6429e59d486faa22f55186f5af84f21177f7fd4a"
+    },
+    {
+      "path": "messages/src/proto/packets.rs",
+      "before_sha256_lf": "f2eff704ac7864162c7833d231a4cc3ea9d02745e132e86d002dbc735f4f75dc",
+      "after_sha256_lf": "9c2495403c40465d6ad5fe6def394dae48471f678e78018eb3761b5aa6419ce6"
+    },
+    {
+      "path": "network/src/client.rs",
+      "before_sha256_lf": "f9dcc9e0ac871fc5536b211b600225132fadeef0fdebe903fa5cedfaa062984f",
+      "after_sha256_lf": "0bff76d2721ab394ca9b9eb2c6a81759a43cf599b523a0e91d2e33e48e901664"
+    },
+    {
+      "path": "network/src/lib.rs",
+      "before_sha256_lf": "c1e6c66bc93d39eae3cc3f9ba1d36e20ef52ac6f09441e848f93f0c632154d12",
+      "after_sha256_lf": "fe52632e244fec0f94aefb865ac16e9a57e8c5074b697fb8800742e9e7943657"
+    },
+    {
+      "path": "network/src/server.rs",
+      "before_sha256_lf": "8543f028b4c593d1981de5959def60500bd5eb5f575ebb2ab18a3ee9a4c036a2",
+      "after_sha256_lf": "c3d0614331b5d2521fa02b57f261d118b8ec8cfe473c46488762ac143c72fbbc"
+    },
+    {
+      "path": "openmp-component/Cargo.toml",
+      "before_sha256_lf": "1f808a4d64e216d8252a9e6d62ee7fe5b65dc9eecf706c3379472aa9d95098b3",
+      "after_sha256_lf": "9c4c7f347a133b407b9d60f4ec09f04043dc71dba2d64050a80f7817ef19c0f6"
+    },
+    {
+      "path": "openmp-component/component/CMakeLists.txt",
+      "before_sha256_lf": "ea5e3fe1bc65339e356368fa893129c8517f21a045106cfd1886e4305bc86e00",
+      "after_sha256_lf": "4e3b4fcc8c26f3e7fbb605dfa433acde0cd4339c5d02d084a01244044f5110e2"
+    },
+    {
+      "path": "openmp-component/component/src/component.cpp",
+      "before_sha256_lf": "bfd77e8b3f471e8391a54b4a824ee9cc886909a551ba64672ce547c7abcb3854",
+      "after_sha256_lf": "a0e62c9c1d05b7fc67a7e431afab64539bef748d4cb870c8a6f560eb141d80fa"
+    },
+    {
+      "path": "openmp-component/component/src/pawn_callback_guard.hpp",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "4d9c6710bf8a1775d70f15d8d1714580919e76ce738c7369063c0380e14ddd30"
+    },
+    {
+      "path": "openmp-component/src/lib.rs",
+      "before_sha256_lf": "d42a1d2b202d7911c27910721e0301ac5b4b2f4641893689425175c0b4cd8b0e",
+      "after_sha256_lf": "5910728c474a41cc4c17fcdc6d3265a0ad5d6e7701012f4110e77d54cebd8309"
+    },
+    {
+      "path": "proto/packets.proto",
+      "before_sha256_lf": "7a715b8f36e5687e76fc69976869f3c72bd10bf18b4fed56e6dc8d30f3c4b721",
+      "after_sha256_lf": "34fd48fac441523ac8d0b4fabcfad9149f7bb12806d82700bad98a9de74b1d13"
+    },
+    {
+      "path": "renderer/src/main.rs",
+      "before_sha256_lf": "ff3f46c6a38b5e3a8f3298f293aeaa70999ec12f3f96e3f2e7fba23509869953",
+      "after_sha256_lf": "54803e8737f623e22ab839eb5ca2dc1e935d6a45d69142d58b8ef678eade4056"
+    },
+    {
+      "path": "server-core/Cargo.toml",
+      "before_sha256_lf": "8184e46d4981fc134f66509903be43dbf9f1bf3f95aa6ba9b2b54f8e7c52206b",
+      "after_sha256_lf": "a1faf1a13098cd3621a6a97389e48a0cd80cdcc9faa5b11d0e21a2a627138e1c"
+    },
+    {
+      "path": "server-core/src/auth.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "aa1884a69ed1f51a3266d50a8f6ca2dd11219944103c2ad851a1675b8b1e314e"
+    },
+    {
+      "path": "server-core/src/lib.rs",
+      "before_sha256_lf": "8f934235dc4882f78dd870b6a7307e4481a3b9a6cf13ce01d3ce079ac7ce2686",
+      "after_sha256_lf": "c8e8f10380b76d2c093d48903b6c55b80a9b1682a6bbfb9c8b2e028758f5d045"
+    },
+    {
+      "path": "server-core/src/server.rs",
+      "before_sha256_lf": "b4ebd030ea803032f8fc8117fa0883762ebf3cd73498e35de36ac4da455c02e8",
+      "after_sha256_lf": "7b27bd390692f21b7ba6716ef2c5ee4edb18e9d9efc3ec288805938126aed710"
+    },
+    {
+      "path": "server/Cargo.toml",
+      "before_sha256_lf": "a132449296f77aae8e549395759c52205205b19655e603b91458abacef74c75f",
+      "after_sha256_lf": "87523b95a2925a0587316f099ab15219570a12d57344cfbb213c2cdf9c06b838"
+    },
+    {
+      "path": "server/cef.inc",
+      "before_sha256_lf": "c4b44cd12e240721010ce94d7d2052bd3fef3a94995e0d611038945ee24bbbc8",
+      "after_sha256_lf": "7150ebeb439dbde2c4e7083c6cd6764a5f2fb3d56eb50ea8bfe785376b90e6b4"
+    },
+    {
+      "path": "server/src/lib.rs",
+      "before_sha256_lf": "150a65e52530fb88a10bef90fca62ed775d5034d6c062b649017a879dd5bf599",
+      "after_sha256_lf": "402480a49d4e3dec9f30d473137f1cdce4505d6aac44a196b6ff6dac0ee0f0c0"
+    },
+    {
+      "path": "server/src/wire_amx_tests.rs",
+      "before_sha256_lf": null,
+      "after_sha256_lf": "44af5008575d44214148ab9230835ccb0f84c50fd71ef29d5fd46fd2f320cbe2"
+    }
+  ]
+}

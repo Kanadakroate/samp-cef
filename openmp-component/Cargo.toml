@@ -10,6 +10,7 @@ name = "cef_openmp"
 crate-type = ["staticlib"]
 
 [dependencies]
+encoding_rs = "=0.8.35"
 cxx = "1.0"
 server-core = { path = "../server-core", package = "cef-server-core" }
 tracing = "0.1.44"

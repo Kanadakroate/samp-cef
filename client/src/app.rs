@@ -25,7 +25,7 @@ use client_api::samp::players::local_player;
 
 use client_api::wndproc;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 
 use retour::GenericDetour;
 
@@ -39,6 +39,7 @@ static APP: StaticCell<App> = StaticCell::new();
 
 pub enum Event {
     Connect(SocketAddr),
+    BindGameConnection(String),
     Timeout,
     NetworkError,
     NetworkJoined,
@@ -46,6 +47,7 @@ pub enum Event {
 
     CreateBrowser {
         id: u32,
+        generation: u32,
         url: String,
         hidden: bool,
         focused: bool,
@@ -56,9 +58,11 @@ pub enum Event {
     DestroyBrowser(u32),
     HideBrowser(u32, bool),
     FocusBrowser(u32, bool),
-    EmitEvent(String, List),
-    EmitEventOnServer(String, String),
-    BrowserCreated(u32, i32),
+    RendererFocusBrowser(u32, u32, bool),
+    RendererHideBrowser(u32, u32, bool),
+    EmitEvent(u32, u32, String, List),
+    EmitEventOnServer(u32, u32, String, String),
+    BrowserCreated(u32, u32, i32),
     AppendToObject(u32, i32),
     RemoveFromObject(u32, i32),
     ToggleDevTools(u32, bool),
@@ -94,7 +98,6 @@ pub struct App {
     network: Option<NetworkClient>,
     callbacks: CallbackList,
     keystate_hook: GenericDetour<extern "stdcall" fn(i32) -> u16>,
-    event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
 
     //
@@ -130,7 +133,7 @@ impl Default for App {
 impl App {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> App {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(1024);
 
         let audio = Audio::new();
 
@@ -162,7 +165,6 @@ impl App {
             initialization: Instant::now(),
             manager,
             keystate_hook,
-            event_tx,
             event_rx,
             callbacks,
             audio,
@@ -205,6 +207,7 @@ impl App {
     }
 
     pub fn connect(&mut self) {
+        if !crate::game_command::supported_game() { return; }
         if self.network.is_some() {
             return;
         }
@@ -231,7 +234,7 @@ impl App {
                 "queuing CEF server connection"
             );
 
-            let network = NetworkClient::new(self.event_tx.clone());
+            let network = NetworkClient::new();
             network.send(Event::Connect(addr));
 
             self.network = Some(network);
@@ -277,16 +280,12 @@ impl App {
 }
 
 pub fn initialize() {
-    let app = App::new();
-    let manager = app.manager();
-
-    crate::render::initialize(manager);
-
-    unsafe {
-        APP.set(app);
+    if !crate::game_command::wait_for_game_module() {
+        tracing::error!("SA:MP module did not load within the startup timeout");
+        return;
     }
-
-    if client_api::samp::version::is_unknown_version() {
+    // Reject missing/unsupported modules before constructing APP or hooks.
+    if !crate::game_command::supported_game() {
         tracing::error!("unsupported SA:MP version detected");
 
         client_api::utils::error_message_box(
@@ -294,10 +293,13 @@ pub fn initialize() {
             "You have installed an unsupported SA:MP version.\nCurrently supported versions are 0.3.DL R1, 0.3.7 R1, and 0.3.7 R3.",
         );
 
-        // don't waste time
-    } else {
-        tracing::info!("client initialized");
+        return;
     }
+    let app = App::new();
+    let manager = app.manager();
+    crate::render::initialize(manager);
+    unsafe { APP.set(app); }
+    tracing::info!("client initialized");
 }
 
 pub fn uninitialize() {
@@ -360,7 +362,11 @@ pub fn mainloop() {
             }
         }
 
-        while let Ok(event) = app.event_rx.try_recv() {
+        // Each network instance owns its receive queue. Dropping it on reconnect
+        // also drops queued callbacks from the previous game/QUIC connection.
+        while let Some(event) = app.network.as_ref().and_then(|net| net.recv())
+            .or_else(|| app.event_rx.try_recv().ok()) {
+
             match event {
                 Event::AlwaysListenKeys(browser_id, listen) => {
                     let manager = app.manager.lock();
@@ -369,6 +375,7 @@ pub fn mainloop() {
 
                 Event::CreateBrowser {
                     id,
+                    generation,
                     url,
                     hidden,
                     focused,
@@ -383,7 +390,7 @@ pub fn mainloop() {
 
                     let show_cursor = {
                         let mut manager = app.manager.lock();
-                        manager.create_browser(id, app.callbacks.clone(), &url);
+                        manager.create_browser(id, generation, app.callbacks.clone(), &url);
                         manager.hide_browser(id, hidden);
                         manager.browser_focus(id, focused);
 
@@ -415,6 +422,19 @@ pub fn mainloop() {
                     manager.hide_browser(id, hide);
                 }
 
+                Event::RendererFocusBrowser(id, generation, focus) => {
+                    let show_cursor = {
+                        let mut manager = app.manager.lock();
+                        if !manager.browser_matches(id, generation) { continue; }
+                        manager.browser_focus(id, focus);
+                        manager.is_input_blocked() && !CMenuManager::is_menu_active()
+                    };
+                    client_api::samp::inputs::show_cursor(show_cursor);
+                }
+                Event::RendererHideBrowser(id, generation, hide) => {
+                    let manager = app.manager.lock();
+                    if manager.browser_matches(id, generation) { manager.hide_browser(id, hide); }
+                }
                 Event::FocusBrowser(id, focus) => {
                     let show_cursor = {
                         let mut manager = app.manager.lock();
@@ -425,23 +445,30 @@ pub fn mainloop() {
                     client_api::samp::inputs::show_cursor(show_cursor);
                 }
 
-                Event::EmitEvent(event, list) => {
+                Event::BindGameConnection(token) => {
+                    // Input::Send dispatches command RPC 50. The default callback
+                    // is chat RPC 101 and must never receive this private token.
+                    crate::game_command::send_binding(&token);
+                }
+                Event::EmitEvent(id, generation, event, list) => {
                     let manager = app.manager.lock();
-                    manager.trigger_event(&event, list);
+                    manager.trigger_browser_event(id, generation, &event, list);
                 }
 
-                Event::EmitEventOnServer(event, arguments) => {
-                    if let Some(network) = app.network.as_mut() {
-                        let event = Event::EmitEventOnServer(event, arguments);
-                        network.send(event);
+                Event::EmitEventOnServer(id, generation, event, arguments) => {
+                    if app.manager.lock().browser_matches(id, generation) {
+                        if let Some(network) = app.network.as_mut() {
+                            network.send(Event::EmitEventOnServer(id, generation, event, arguments));
+                        }
                     }
                 }
 
-                Event::BrowserCreated(id, code) => {
+                Event::BrowserCreated(id, generation, code) => {
+                    if !app.manager.lock().browser_matches(id, generation) { continue; }
                     tracing::info!(browser = id, status = code, "browser created");
 
                     if let Some(network) = app.network.as_mut() {
-                        let event = Event::BrowserCreated(id, code);
+                        let event = Event::BrowserCreated(id, generation, code);
                         network.send(event);
                     }
 
@@ -622,19 +649,9 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
                 } else if msg == WM_CHAR || msg == WM_SYSCHAR {
                     event.type_ = cef_key_event_type_t::KEYEVENT_CHAR;
 
-                    // GTA:SA creates an ANSI window, so WM_CHAR values in the byte range use the
-                    // active Windows-1251 code page. Preserve that behavior while also accepting
-                    // UTF-16 values produced by Unicode input methods.
-                    let character = if wparam <= u8::MAX as usize {
-                        let bytes = [wparam as u8];
-                        encoding_rs::WINDOWS_1251
-                            .decode(&bytes)
-                            .0
-                            .encode_utf16()
-                            .next()
-                    } else {
-                        u16::try_from(wparam).ok()
-                    };
+                    // LR uses Windows-1252 for the GTA ANSI window. Values above
+                    // the byte range retain the existing UTF-16 input behavior.
+                    let character = crate::text_encoding::window_character(wparam);
 
                     if let Some(character) = character {
                         event.windows_key_code = character as i32;

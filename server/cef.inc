@@ -20,7 +20,10 @@
 	native cef_on_player_connect(player_id, const ip[]);
 	native cef_on_player_disconnect(player_id);
 	native cef_emit_event(player_id, const event[], {CEF_ValueType, Float, _}:...);
-	native cef_subscribe(const event[], const callback[]);
+	native cef_lr_protocol_version();
+	native cef_bind_game_connection(player_id, const token[]);
+	native cef_subscribe_browser(const event[], const callback[]);
+	native cef_emit_browser_event(player_id, browser_id, const event[], {CEF_ValueType, Float, _}:...);
 	native cef_hide_browser(player_id, browser_id, bool:hide);
 	native cef_create_ext_browser(player_id, browser_id, const texture[], const url[], scale);
 	native cef_append_to_object(player_id, browser_id, object_id);
@@ -33,7 +36,7 @@
 	native cef_load_url(player_id, browser_id, const url[]);
 
 	forward OnCefInitialize(player_id, success);
-	forward OnCefBrowserCreated(player_id, browser_id, status_code);
+	forward OnCefBrowserCreatedScoped(player_id, browser_id, browser_generation, status_code);
 
 	public OnPlayerConnect(playerid)
 	{

@@ -124,8 +124,51 @@ extern "system" fn render<I: Client>(this: *mut cef_client_t) -> *mut cef_render
 // request
 
 extern "system" fn request(_this: *mut cef_client_t) -> *mut cef_request_handler_t {
-    println!("request");
-    null_mut()
+    let mut object: cef_request_handler_t = unsafe { std::mem::zeroed() };
+    object.on_before_browse = Some(local_before_browse);
+    object.on_open_urlfrom_tab = Some(block_open_url);
+    object.get_resource_request_handler = Some(local_resources);
+    Box::into_raw(Box::new(Wrapper::new(object, ()))) as *mut _
+}
+
+fn local_url(request: *mut cef_sys::cef_request_t) -> bool {
+    if request.is_null() { return false; }
+    let url = unsafe { (*request).get_url.map(|get| get(request)) };
+    let Some(url) = url else { return false; };
+    let url = crate::types::string::CefString::from(url).to_string();
+    crate::local_policy::allows_asset_url(&url)
+}
+
+extern "system" fn local_before_browse(
+    _: *mut cef_request_handler_t, _: *mut cef_browser_t, frame: *mut cef_frame_t,
+    request: *mut cef_sys::cef_request_t, _: i32, _: i32,
+) -> i32 {
+    // LR has no subframes, popups or external navigation. A rejected URL never
+    // receives a privileged renderer context, even via redirects or links.
+    let main = !frame.is_null() && unsafe { (*frame).is_main.map(|f| f(frame) == 1).unwrap_or(false) };
+    if main && local_url(request) { 0 } else { 1 }
+}
+
+extern "system" fn block_open_url(
+    _: *mut cef_request_handler_t, _: *mut cef_browser_t, _: *mut cef_frame_t,
+    _: *const cef_sys::cef_string_t, _: cef_sys::cef_window_open_disposition_t::Type, _: i32,
+) -> i32 { 1 }
+
+extern "system" fn local_resources(
+    _: *mut cef_request_handler_t, _: *mut cef_browser_t, _: *mut cef_frame_t,
+    _: *mut cef_sys::cef_request_t, _: i32, _: i32, _: *const cef_sys::cef_string_t, _: *mut i32,
+) -> *mut cef_sys::cef_resource_request_handler_t {
+    let mut object: cef_sys::cef_resource_request_handler_t = unsafe { std::mem::zeroed() };
+    object.on_before_resource_load = Some(local_before_resource);
+    Box::into_raw(Box::new(Wrapper::new(object, ()))) as *mut _
+}
+
+extern "system" fn local_before_resource(
+    _: *mut cef_sys::cef_resource_request_handler_t, _: *mut cef_browser_t,
+    _: *mut cef_frame_t, request: *mut cef_sys::cef_request_t, _: *mut cef_sys::cef_callback_t,
+) -> cef_sys::cef_return_value_t::Type {
+    if local_url(request) { cef_sys::cef_return_value_t::RV_CONTINUE }
+    else { cef_sys::cef_return_value_t::RV_CANCEL }
 }
 
 extern "system" fn permission<I: Client>(this: *mut cef_client_t) -> *mut cef_permission_handler_t {

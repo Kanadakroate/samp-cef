@@ -150,11 +150,11 @@ impl Manager {
         }
     }
 
-    pub fn create_browser(&mut self, id: u32, cbs: CallbackList, url: &str) {
+    pub fn create_browser(&mut self, id: u32, generation: u32, cbs: CallbackList, url: &str) {
         let render_mode = crate::utils::current_render_mode();
         tracing::trace!(browser = id, url, ?render_mode, "creating overlay browser");
 
-        let client = WebClient::new(id, cbs, self.event_tx.clone(), self.audio.clone());
+        let client = WebClient::new(id, generation, cbs, self.event_tx.clone(), self.audio.clone());
 
         crate::browser::cef::create_browser(client.clone(), url);
         self.append_client(id, client);
@@ -288,31 +288,10 @@ impl Manager {
             return;
         }
 
-        if let Some(&focus) = self.focused.as_ref() {
-            for client in self
-                .clients
-                .values()
-                .filter(|client| client.id() != focus && !client.is_extern() && !client.is_hidden())
-            {
-                client.draw();
-            }
-
-            if let Some(focused) = self
-                .clients
-                .get(&focus)
-                .filter(|client| !client.is_extern() && !client.is_hidden())
-            {
-                focused.draw();
-            }
-        } else {
-            for client in self
-                .clients
-                .values()
-                .filter(|client| !client.is_extern() && !client.is_hidden())
-            {
-                client.draw();
-            }
-        }
+        let mut visible = self.clients.values()
+            .filter(|client| !client.is_extern() && !client.is_hidden()).collect::<Vec<_>>();
+        visible.sort_unstable_by_key(|client| super::render_order::key(client.id(), self.focused));
+        for client in visible { client.draw(); }
     }
 
     #[inline]
@@ -475,8 +454,25 @@ impl Manager {
         }
     }
 
+    pub fn browser_matches(&self, id: u32, generation: u32) -> bool {
+        generation != 0 && self.clients.get(&id).is_some_and(|client| client.generation() == generation)
+    }
+
+    pub fn trigger_browser_event(&self, id: u32, generation: u32, event_name: &str, list: List) {
+        if !self.browser_matches(id, generation) { return; }
+        let client = &self.clients[&id];
+        if let Some(frame) = client.browser().map(|browser| browser.main_frame()) {
+            if !cef::local_policy::allows_asset_url(&frame.url()) { return; }
+            let msg = cef::process_message::ProcessMessage::create("trigger_event");
+            msg.argument_list().set_string(0, &CefString::new(event_name));
+            msg.argument_list().set_list(1, list);
+            frame.send_process_message(cef::ProcessId::Renderer, msg);
+        }
+    }
+
     pub fn trigger_event(&self, event_name: &str, list: List) {
-        for client in self.clients.values() {
+        // The legacy local plugin API cannot broadcast into server-owned browsers.
+        for client in self.clients.values().filter(|client| client.generation() == 0) {
             if let Some(frame) = client.browser().map(|browser| browser.main_frame()) {
                 let name = CefString::new(event_name);
                 let msg = cef::process_message::ProcessMessage::create("trigger_event");

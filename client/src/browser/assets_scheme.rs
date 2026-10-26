@@ -232,7 +232,7 @@ pub fn resolve_browser_url(value: &str) -> String {
             });
     }
 
-    if is_valid_asset_url(value) || has_url_scheme(value) {
+    if is_valid_asset_url(value) {
         return value.to_string();
     }
 

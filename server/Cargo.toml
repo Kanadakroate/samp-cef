@@ -13,3 +13,8 @@ samp = { git = "https://github.com/zottce/samp-rs.git", rev = "2e9192713bf9a77ee
 server-core = { path = "../server-core", package = "cef-server-core" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "smallvec"] }
+
+[dev-dependencies]
+messages = { path = "../messages", package = "cef-messages" }
+quick-protobuf = "=0.8.1"
+serde_json = "=1.0.149"

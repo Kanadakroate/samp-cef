@@ -89,6 +89,7 @@ fn rect_fits(rect: &cef_rect_t, width: usize, height: usize) -> bool {
 
 pub struct WebClient {
     id: u32, // static
+    generation: u32, // immutable native lifetime, never accepted from JavaScript
     is_extern: bool,
     hidden: AtomicBool,
     prev_hidden_flag: AtomicBool,
@@ -172,8 +173,13 @@ impl Client for WebClientRef {
     }
 
     fn on_process_message(
-        &self, _browser: Browser, _frame: Frame, _source: ProcessId, msg: ProcessMessage,
+        &self, _browser: Browser, frame: Frame, source: ProcessId, msg: ProcessMessage,
     ) -> bool {
+        if !matches!(source, ProcessId::Renderer) || !frame.is_main()
+            || !cef::local_policy::allows_asset_url(&frame.url())
+            || self.0.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         let name = msg.name().to_string();
 
         tracing::trace!(
@@ -193,7 +199,7 @@ impl Client for WebClientRef {
                     _ => false,
                 };
 
-                handle_result(self.0.event_tx.send(Event::FocusBrowser(self.0.id, focus)));
+                handle_result(self.0.event_tx.try_send(Event::RendererFocusBrowser(self.0.id, self.0.generation, focus)));
 
                 return true;
             }
@@ -208,7 +214,7 @@ impl Client for WebClientRef {
                     _ => false,
                 };
 
-                handle_result(self.0.event_tx.send(Event::HideBrowser(self.0.id, hide)));
+                handle_result(self.0.event_tx.try_send(Event::RendererHideBrowser(self.0.id, self.0.generation, hide)));
 
                 return true;
             }
@@ -221,6 +227,7 @@ impl Client for WebClientRef {
                 }
 
                 let event_name = args.string(0).to_string();
+                if event_name.is_empty() || event_name.len() > 64 || event_name.contains('\0') { return true; }
                 let callbacks = self.0.callbacks.lock();
 
                 if let Some(cb) = callbacks.get(&event_name) {
@@ -233,26 +240,21 @@ impl Client for WebClientRef {
                     }
                 }
 
-                let mut arguments = String::new();
-
-                for idx in 1..args.len() {
-                    let arg = match args.get_type(idx) {
-                        ValueType::String => args.string(idx).to_string(),
-                        ValueType::Bool => (if args.bool(idx) { 1 } else { 0 }).to_string(),
-                        ValueType::Double => args.double(idx).to_string(),
-                        ValueType::Integer => args.integer(idx).to_string(),
-                        _ => "CEF_NULL".to_string(),
-                    };
-
-                    arguments.push_str(&arg);
-
-                    if idx != args.len() - 1 {
-                        arguments.push(' ');
-                    }
+                // Preserve a single JSON string byte-for-byte; legacy forms accept
+                // integers only. Arbitrary string concatenation is ambiguous.
+                if self.0.generation == 0 || event_name.len() > 64 || event_name.contains('\0') {
+                    return true;
                 }
-
-                let event = Event::EmitEventOnServer(event_name, arguments);
-                handle_result(self.0.event_tx.send(event));
+                use super::event_args::{Argument, serialize};
+                if args.len() > 9 { return true; }
+                let values: Vec<_> = (1..args.len()).map(|idx| match args.get_type(idx) {
+                    ValueType::String => Argument::Text(args.string(idx).to_string()),
+                    ValueType::Integer => Argument::Integer(args.integer(idx)),
+                    _ => Argument::Unsupported,
+                }).collect();
+                let Some(arguments) = serialize(&values) else { return true; };
+                let event = Event::EmitEventOnServer(self.0.id, self.0.generation, event_name, arguments);
+                handle_result(self.0.event_tx.try_send(event));
             }
 
             _ => (),
@@ -267,20 +269,8 @@ impl PermissionHandler for WebClientRef {
         &self, _browser: Browser, _prompt_id: u64, requesting_origin: String,
         requested_permissions: u32,
     ) -> Option<PermissionRequestResult> {
-        const LOCAL_NETWORK_PERMISSIONS: u32 =
-            (cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED
-                | cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK
-                | cef_sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK)
-                as u32;
-
-        if requesting_origin.trim_end_matches('/') == "sampcef://assets"
-            && requested_permissions != 0
-            && requested_permissions & !LOCAL_NETWORK_PERMISSIONS == 0
-        {
-            Some(PermissionRequestResult::Accept)
-        } else {
-            None
-        }
+        let _ = (requesting_origin, requested_permissions);
+        Some(PermissionRequestResult::Deny)
     }
 }
 
@@ -394,6 +384,10 @@ impl RenderHandler for WebClientRef {
 }
 
 impl LoadHandler for WebClientRef {
+    fn on_load_error(&self, _browser: Browser, frame: Frame, error_code: i32) {
+        if frame.is_main() { self.0.notify_creation_error(error_code); }
+    }
+
     fn on_load_end(&self, _browser: Browser, frame: Frame, status_code: i32) {
         tracing::trace!(
             browser = self.0.id,
@@ -401,9 +395,9 @@ impl LoadHandler for WebClientRef {
             "browser load completed"
         );
 
-        if frame.is_main() {
-            let event = Event::BrowserCreated(self.0.id, status_code);
-            handle_result(self.0.event_tx.send(event));
+        if frame.is_main() && cef::local_policy::allows_asset_url(&frame.url()) && !self.0.closing.load(Ordering::SeqCst) {
+            let event = Event::BrowserCreated(self.0.id, self.0.generation, status_code);
+            handle_result(self.0.event_tx.try_send(event));
         }
     }
 }
@@ -462,9 +456,15 @@ impl AudioHandler for WebClientRef {
 }
 
 impl WebClient {
+    pub fn notify_creation_error(&self, error_code: i32) {
+        if self.generation != 0 && !self.closing.load(Ordering::SeqCst) {
+            let _ = self.event_tx.try_send(Event::BrowserCreated(self.id, self.generation, error_code.min(-1)));
+        }
+    }
+
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
-        id: u32, cbs: CallbackList, event_tx: Sender<Event>, audio: Arc<Audio>,
+        id: u32, generation: u32, cbs: CallbackList, event_tx: Sender<Event>, audio: Arc<Audio>,
     ) -> Arc<WebClient> {
         let rect = crate::utils::client_rect();
 
@@ -491,6 +491,7 @@ impl WebClient {
             audio,
             event_tx,
             id,
+            generation,
             windowless_frame_rate: AtomicI32::new(0),
         };
 
@@ -517,6 +518,7 @@ impl WebClient {
             audio,
             event_tx,
             id,
+            generation: 0,
             windowless_frame_rate: AtomicI32::new(0),
         };
 
@@ -738,6 +740,8 @@ impl WebClient {
             browser.main_frame().load_url(&url);
         }
     }
+
+    pub fn generation(&self) -> u32 { self.generation }
 
     pub fn id(&self) -> u32 {
         self.id

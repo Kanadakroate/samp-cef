@@ -14,6 +14,9 @@ if(NOT OPENMP_EXT_BUILD_DIR AND OPENMP_EXT_ROOT)
 endif()
 set(SAMP_CEF_ENABLE_GRPC_EXT "OFF" CACHE STRING "Enable openmp-ext gRPC integration: AUTO, ON, or OFF")
 set_property(CACHE SAMP_CEF_ENABLE_GRPC_EXT PROPERTY STRINGS AUTO ON OFF)
+if(NOT SAMP_CEF_ENABLE_GRPC_EXT STREQUAL "OFF")
+	message(FATAL_ERROR "LR protocol 1 requires SAMP_CEF_ENABLE_GRPC_EXT=OFF; the optional gRPC API has not been qualified for scoped callbacks")
+endif()
 set(OPEN_MP_SERVER_ROOT "$ENV{OPEN_MP_SERVER_ROOT}" CACHE PATH "Optional open.mp server root used by the install target")
 set(SAMP_CEF_INSTALL_COMPONENT_DIR "" CACHE PATH "Directory where open.mp component binaries are installed")
 set(SAMP_CEF_INSTALL_COMPONENT_NAME "cef-openmp" CACHE STRING "CMake install component used for CEF open.mp artifacts")
@@ -35,6 +38,7 @@ set(GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 set(GENERATED_CXXBRIDGE_HEADER "${GENERATED_INCLUDE_DIR}/cef-openmp/src/lib.rs.h")
 
 set(CARGO_BUILD_ARGS build --release --manifest-path "${RUST_MANIFEST}")
+list(APPEND CARGO_BUILD_ARGS --locked)
 if(SAMP_CEF_RUST_TARGET)
 	list(APPEND CARGO_BUILD_ARGS --target "${SAMP_CEF_RUST_TARGET}")
 	set(RUST_LIB_DIR "${SAMP_CEF_CARGO_TARGET_DIR}/${SAMP_CEF_RUST_TARGET}/release")
@@ -48,6 +52,11 @@ else()
 	set(RUST_STATIC_LIB "${RUST_LIB_DIR}/libcef_openmp.a")
 endif()
 
+file(GLOB_RECURSE SAMP_CEF_SERVER_RUST_INPUTS CONFIGURE_DEPENDS
+	"${SAMP_CEF_ROOT}/server-core/src/*.rs"
+	"${SAMP_CEF_ROOT}/network/src/*.rs"
+	"${SAMP_CEF_ROOT}/messages/src/*.rs"
+)
 add_custom_command(
 	OUTPUT
 		"${RUST_STATIC_LIB}"
@@ -71,6 +80,10 @@ add_custom_command(
 		"${SAMP_CEF_ROOT}/server-core/src/lib.rs"
 		"${SAMP_CEF_ROOT}/server-core/src/server.rs"
 		"${SAMP_CEF_ROOT}/server-core/src/client.rs"
+		${SAMP_CEF_SERVER_RUST_INPUTS}
+		"${SAMP_CEF_ROOT}/server-core/Cargo.toml"
+		"${SAMP_CEF_ROOT}/network/Cargo.toml"
+		"${SAMP_CEF_ROOT}/messages/Cargo.toml"
 	VERBATIM
 )
 
@@ -79,6 +92,10 @@ add_custom_target(cef_openmp_rust DEPENDS "${RUST_STATIC_LIB}" "${GENERATED_CXXB
 add_library(cef SHARED
 	src/component.cpp
 )
+if(MSVC)
+	# Match the Rust workspace's crt-static release library.
+	set_property(TARGET cef PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 set(SAMP_CEF_GRPC_EXT_ENABLED FALSE)
 
@@ -94,6 +111,9 @@ target_link_libraries(cef PRIVATE
 	OMP-SDK
 	"${RUST_STATIC_LIB}"
 )
+if(WIN32)
+	target_link_libraries(cef PRIVATE ws2_32 userenv advapi32 ntdll bcrypt crypt32 secur32 ncrypt iphlpapi)
+endif()
 
 target_compile_definitions(cef PRIVATE
 	OMP_VERSION_MAJOR=1
@@ -101,6 +121,7 @@ target_compile_definitions(cef PRIVATE
 	OMP_VERSION_PATCH=8
 	FLOATPOINT
 	PAWN_CELL_SIZE=32
+	HAVE_STDINT_H=1
 )
 
 string(TOUPPER "${SAMP_CEF_ENABLE_GRPC_EXT}" SAMP_CEF_ENABLE_GRPC_EXT_UPPER)

@@ -24,10 +24,12 @@ impl Packet {
 
 pub struct NetworkClient {
     event_tx: Sender<Event>,
+    incoming_rx: Receiver<Event>,
 }
 
 impl NetworkClient {
-    pub fn new(net_tx: Sender<Event>) -> NetworkClient {
+    pub fn new() -> NetworkClient {
+        let (net_tx, incoming_rx) = crossbeam_channel::unbounded();
         let (client_tx, client_rx) = crossbeam_channel::unbounded();
 
         std::thread::spawn(move || {
@@ -42,8 +44,11 @@ impl NetworkClient {
 
         NetworkClient {
             event_tx: client_tx,
+            incoming_rx,
         }
     }
+
+    pub fn recv(&self) -> Option<Event> { self.incoming_rx.try_recv().ok() }
 
     pub fn send(&self, message: Event) {
         handle_result(self.event_tx.send(message));
@@ -64,14 +69,6 @@ enum ConnectionState {
 }
 
 impl ConnectionState {
-    fn addr(&self) -> Option<SocketAddr> {
-        match self {
-            ConnectionState::Auth(addr, _, _) => Some(*addr),
-            ConnectionState::Connected(addr, _) => Some(*addr),
-            _ => None,
-        }
-    }
-
     fn peer(&self) -> Option<PeerId> {
         match self {
             ConnectionState::Auth(_, _, peer) => Some(*peer),
@@ -112,15 +109,17 @@ impl Network {
     fn handle_packet(&mut self, packet: packets::Packet) {
         use packets::PacketId::*;
 
+        if !matches!(self.connection_state, ConnectionState::Connected(..))
+            && !matches!(packet.packet_id, OPEN_CONNECTION | JOIN_RESPONSE) { return; }
         match packet.packet_id {
             OPEN_CONNECTION => {
-                if let ConnectionState::Auth(_, _, peer) = &self.connection_state {
-                    self.net_connect(*peer);
-                } else {
-                    tracing::trace!(
-                        state = ?self.connection_state,
-                        "unexpected open-connection response"
-                    );
+                if self.connection_state.is_auth() {
+                    if let Ok(open) = deserialize_from_slice::<packets::OpenConnection>(&packet.bytes) {
+                        let token = open.bind_token.to_string();
+                        if token.len() == 64 && token.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+                            handle_result(self.event_tx.send(Event::BindGameConnection(token)));
+                        }
+                    }
                 }
             }
 
@@ -229,6 +228,7 @@ impl Network {
     fn handle_create_browser(&mut self, packet: packets::CreateBrowser) {
         let event = Event::CreateBrowser {
             id: packet.browser_id,
+            generation: packet.browser_generation,
             url: packet.url.to_string(),
             hidden: packet.hidden,
             focused: packet.focused,
@@ -242,6 +242,8 @@ impl Network {
     }
 
     fn handle_emit_event(&mut self, packet: packets::EmitEvent) {
+        let (Some(id), Some(generation)) = (packet.browser_id, packet.browser_generation) else { return; };
+        if generation == 0 { return; }
         let list = cef::types::list::List::new();
 
         for (idx, arg) in packet.arguments.iter().enumerate() {
@@ -261,7 +263,7 @@ impl Network {
 
         handle_result(
             self.event_tx
-                .send(Event::EmitEvent(packet.event_name.to_string(), list)),
+                .send(Event::EmitEvent(id, generation, packet.event_name.to_string(), list)),
         );
     }
 
@@ -325,6 +327,7 @@ impl Network {
     }
 
     fn net_open_connection(&mut self, address: SocketAddr) {
+        if let Some(peer) = self.connection_state.peer() { self.socket.disconnect(peer); }
         let peer = self.socket.connect(address);
         self.connection_state = ConnectionState::Auth(address, Instant::now(), peer);
 
@@ -335,24 +338,11 @@ impl Network {
         );
     }
 
-    fn net_connect(&mut self, peer: PeerId) {
-        let auth = packets::RequestJoin {
-            plugin_version: crate::app::CEF_PLUGIN_VERSION,
-        };
-
-        let Ok(packet) = messages::try_into_packet(auth) else {
-            tracing::error!(packet = "request_join", "cannot serialize network packet");
-            return;
-        };
-
-        tracing::trace!(?peer, "sending join request");
-
-        self.socket.send_message(peer, packet);
-    }
-
-    fn net_emit_event(&mut self, event: String, args: String) {
+    fn net_emit_event(&mut self, browser_id: u32, browser_generation: u32, event: String, args: String) {
         if let ConnectionState::Connected(_address, peer) = self.connection_state {
             let emit = packets::EmitEvent {
+                browser_id: Some(browser_id),
+                browser_generation: Some(browser_generation),
                 event_name: event.into(),
                 args: Some(args.into()),
                 arguments: Vec::new(),
@@ -367,10 +357,11 @@ impl Network {
         }
     }
 
-    fn net_browser_created(&mut self, browser_id: u32, status_code: i32) {
+    fn net_browser_created(&mut self, browser_id: u32, browser_generation: u32, status_code: i32) {
         if let ConnectionState::Connected(_address, peer) = self.connection_state {
             let created = packets::BrowserCreated {
                 browser_id,
+                browser_generation,
                 status_code,
             };
 
@@ -399,23 +390,11 @@ impl Network {
                         }
                     }
 
-                    SocketEvent::Disconnect(peer, _addr) => {
+                    SocketEvent::Disconnect(peer, _) | SocketEvent::ConnectionError(peer) => {
                         if peer == server_peer {
-                            tracing::debug!(?peer, "CEF server disconnected");
+                            self.connection_state = ConnectionState::Disconnected;
                             handle_result(self.event_tx.send(Event::Timeout));
-
-                            if !self.connection_state.is_auth() {
-                                self.net_open_connection(self.connection_state.addr().unwrap());
-                            }
-                        }
-                    }
-
-                    SocketEvent::ConnectionError(error) => {
-                        tracing::warn!(?error, "CEF connection failed");
-                        handle_result(self.event_tx.send(Event::Timeout));
-
-                        if !self.connection_state.is_auth() {
-                            self.net_open_connection(self.connection_state.addr().unwrap());
+                            break;
                         }
                     }
 
@@ -425,18 +404,20 @@ impl Network {
         }
 
         if let ConnectionState::Auth(addr, time, _) = &self.connection_state
-            && time.elapsed() >= Duration::from_millis(2500)
+            && time.elapsed() >= Duration::from_secs(15)
         {
-            tracing::debug!(server = %addr, "retrying CEF server connection");
-            self.net_open_connection(*addr);
+            let _ = addr;
+            if let Some(peer) = self.connection_state.peer() { self.socket.disconnect(peer); }
+            self.connection_state = ConnectionState::Disconnected;
+            handle_result(self.event_tx.send(Event::Timeout));
         }
     }
 
     fn process_event(&mut self, event: Event) {
         match event {
             Event::Connect(addr) => self.net_open_connection(addr),
-            Event::EmitEventOnServer(event, arguments) => self.net_emit_event(event, arguments),
-            Event::BrowserCreated(id, code) => self.net_browser_created(id, code),
+            Event::EmitEventOnServer(id, generation, event, arguments) => self.net_emit_event(id, generation, event, arguments),
+            Event::BrowserCreated(id, generation, code) => self.net_browser_created(id, generation, code),
             _ => (),
         }
     }

@@ -19,7 +19,7 @@ use cef::v8::{V8Context, V8Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-type Callbacks = HashMap<String, Vec<(V8Value, V8Context)>>;
+type Callbacks = HashMap<(i32, String), Vec<(V8Value, V8Context)>>;
 const ASSET_SCHEME: &str = "sampcef";
 const ASSET_SCHEME_OPTIONS: i32 = cef_sys::cef_scheme_options_t::CEF_SCHEME_OPTION_STANDARD
     | cef_sys::cef_scheme_options_t::CEF_SCHEME_OPTION_SECURE
@@ -34,6 +34,7 @@ pub struct Handler {
 
 impl V8Handler for Handler {
     fn execute(&self, name: CefString, args: Vec<V8Value>) -> bool {
+        if !trusted_frame(&self.frame) { return false; }
         let name = name.to_string();
 
         match name.as_str() {
@@ -82,7 +83,7 @@ impl V8Handler for Handler {
                 let func = args[1].clone();
 
                 let mut events = self.subs.lock().unwrap();
-                let subs = events.entry(name).or_default();
+                let subs = events.entry((self.frame.browser().identifier(), name)).or_default();
 
                 let ctx = V8Context::current_context();
                 subs.push((func, ctx));
@@ -100,7 +101,7 @@ impl V8Handler for Handler {
 
                 let mut events = self.subs.lock().unwrap();
 
-                if let Some(subs) = events.get_mut(&name) {
+                if let Some(subs) = events.get_mut(&(self.frame.browser().identifier(), name)) {
                     let ctx = V8Context::current_context();
 
                     if let Some(idx) = subs
@@ -171,6 +172,7 @@ impl App for Application {
 
 impl RenderProcessHandler for Application {
     fn on_context_created(&self, _browser: Browser, frame: Frame, context: V8Context) {
+        if !trusted_frame(&frame) { return; }
         let handler = Handler {
             subs: self.subs.clone(),
             frame,
@@ -219,8 +221,9 @@ impl RenderProcessHandler for Application {
     fn on_webkit_initialized(&self) {}
 
     fn on_process_message(
-        &self, _browser: Browser, _frame: Frame, _source: ProcessId, msg: ProcessMessage,
+        &self, browser: Browser, frame: Frame, source: ProcessId, msg: ProcessMessage,
     ) -> bool {
+        if !matches!(source, ProcessId::Browser) || !trusted_frame(&frame) { return false; }
         let name = msg.name().to_string();
 
         if name == "trigger_event" {
@@ -229,7 +232,7 @@ impl RenderProcessHandler for Application {
             if let Some(list) = args.list(1) {
                 let events = self.subs.lock().unwrap();
 
-                if let Some(subs) = events.get(&event) {
+                if let Some(subs) = events.get(&(browser.identifier(), event)) {
                     let subs_clone = subs.clone();
 
                     drop(events); // drop lock
@@ -253,6 +256,10 @@ impl RenderProcessHandler for Application {
 
         false
     }
+}
+
+fn trusted_frame(frame: &Frame) -> bool {
+    frame.is_main() && cef::local_policy::allows_asset_url(&frame.url())
 }
 
 fn main() {

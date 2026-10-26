@@ -11,7 +11,7 @@ impl_into_packet!(FocusBrowser, PacketId::FOCUS_BROWSER);
 impl_into_packet!(AlwaysListenKeys, PacketId::ALWAYS_LISTEN_KEYS);
 impl_into_packet!(BrowserCreated, PacketId::BROWSER_CREATED);
 impl_into_packet!(Got, PacketId::GOT);
-impl_into_packet!(OpenConnection, PacketId::OPEN_CONNECTION);
+impl_into_packet!(OpenConnection<'a>, PacketId::OPEN_CONNECTION);
 impl_into_packet!(CreateExternalBrowser<'a>, PacketId::CREATE_EXTERNAL_BROWSER);
 impl_into_packet!(AppendToObject, PacketId::APPEND_TO_OBJECT);
 impl_into_packet!(RemoveFromObject, PacketId::REMOVE_FROM_OBJECT);

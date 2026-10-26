@@ -253,6 +253,7 @@ unsafe extern "C" fn cef_create_browser(id: u32, url: *const c_char, hidden: boo
 
         let event = Event::CreateBrowser {
             id,
+            generation: 0,
             hidden,
             focused,
             url: url_rust.to_string(),

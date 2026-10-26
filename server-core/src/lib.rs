@@ -1,140 +1,57 @@
-use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
+use std::collections::HashMap;
 use crossbeam_channel::Receiver;
-use tracing::trace;
-
-mod client;
+use network::PeerId;
+mod auth;
 mod server;
-
 use crate::server::Server;
-
 pub use messages::packets::EventValue;
-
-const INIT_TIMEOUT: Duration = Duration::from_secs(5);
-
+const EVENT_SCAN_BUDGET: usize = 128;
+const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
-    EmitEvent {
-        player_id: i32,
-        event: String,
-        arguments: String,
-    },
-    PlayerInitialized {
-        player_id: i32,
-        success: bool,
-    },
-    BrowserCreated {
-        player_id: i32,
-        browser_id: u32,
-        code: i32,
-    },
+    EmitEvent { player_id: i32, browser_id: u32, browser_generation: u32, event: String, arguments: String },
+    PlayerInitialized { player_id: i32, success: bool },
+    BrowserCreated { player_id: i32, browser_id: u32, browser_generation: u32, code: i32 },
 }
-
 #[derive(Debug)]
 pub(crate) enum ServerEvent {
-    EmitEvent {
-        player_id: i32,
-        event: String,
-        arguments: String,
-    },
-    PlayerConnected(i32),
-    BrowserCreated {
-        player_id: i32,
-        browser_id: u32,
-        code: i32,
-    },
+    EmitEvent { peer: PeerId, player_id: i32, game_generation: u64, browser_id: u32, browser_generation: u32, event: String, arguments: String },
+    PlayerConnected { peer: PeerId, player_id: i32, game_generation: u64 },
+    BrowserCreated { peer: PeerId, player_id: i32, game_generation: u64, browser_id: u32, browser_generation: u32, code: i32 },
 }
-
-enum AwaitConnection {
-    Pending(Instant),
-    TimedOut,
-}
-
-impl AwaitConnection {
-    fn notify_timeout(&mut self, now: Instant) -> bool {
-        let AwaitConnection::Pending(started_at) = self else {
-            return false;
-        };
-
-        if now.duration_since(*started_at) < INIT_TIMEOUT {
-            return false;
-        }
-
-        *self = AwaitConnection::TimedOut;
-        true
-    }
-}
-
 pub struct ServerCore {
-    server: Arc<Mutex<Server>>,
-    event_rx: Receiver<ServerEvent>,
-    await_connect: std::collections::HashMap<i32, AwaitConnection>,
-    ips: std::collections::HashMap<i32, IpAddr>,
-    pending_events: VecDeque<CoreEvent>,
+    server: Arc<Mutex<Server>>, event_rx: Receiver<ServerEvent>,
+    await_connect: HashMap<i32, (u64, Instant, bool)>,
+}
+impl Drop for ServerCore {
+    fn drop(&mut self) { Server::shutdown(&self.server); }
 }
 
 impl ServerCore {
     pub fn new(addr: SocketAddr) -> Result<Self, String> {
         let server = Server::new(addr)?;
-
-        let event_rx = {
-            let s = server.lock().unwrap();
-            s.receiver()
-        };
-
-        Ok(Self {
-            server,
-            event_rx,
-            await_connect: std::collections::HashMap::new(),
-            ips: std::collections::HashMap::new(),
-            pending_events: VecDeque::new(),
-        })
+        let event_rx = server.lock().unwrap().receiver();
+        Ok(Self { server, event_rx, await_connect: HashMap::new() })
     }
-
     pub fn allow_connection(&mut self, player_id: i32, addr: IpAddr) {
-        trace!("allow_connection {} {:?}", player_id, addr);
-
-        self.ips.insert(player_id, addr);
-
-        let already_connected = {
-            let server = self.server.lock().unwrap();
-            server.has_plugin(player_id)
-        };
-
-        {
-            let mut server = self.server.lock().unwrap();
-            server.allow_connection(player_id, addr);
-        }
-
-        if !already_connected {
-            self.await_connect
-                .insert(player_id, AwaitConnection::Pending(Instant::now()));
-        }
+        let mut server = self.server.lock().unwrap();
+        server.allow_connection(player_id, addr);
+        if let Some(generation) = server.game_generation(player_id) { self.await_connect.insert(player_id, (generation, Instant::now(), false)); }
     }
-
     pub fn remove_connection(&mut self, player_id: i32) {
-        trace!("remove_connection {}", player_id);
-
-        let ip = self.ips.remove(&player_id);
-
-        {
-            let mut server = self.server.lock().unwrap();
-            server.remove_connection(player_id, ip);
-        }
-
+        self.server.lock().unwrap().remove_connection(player_id, None);
         self.await_connect.remove(&player_id);
     }
-
-    pub fn create_browser(
-        &mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool,
-    ) {
-        let mut server = self.server.lock().unwrap();
-        server.create_browser(player_id, browser_id, url, hidden, focused);
+    pub fn bind_game_connection(&self, player_id: i32, token: &str) -> bool { self.server.lock().unwrap().bind_game_connection(player_id, token) }
+    pub fn create_browser(&mut self, player_id: i32, browser_id: i32, url: String, hidden: bool, focused: bool) -> bool {
+        self.server.lock().unwrap().create_browser(player_id, browser_id, url, hidden, focused)
     }
-
+    pub fn emit_browser_event(&self, player_id: i32, browser_id: u32, event: &str, arguments: Vec<EventValue<'static>>) -> bool {
+        self.server.lock().unwrap().emit_browser_event(player_id, browser_id, event, arguments)
+    }
     pub fn destroy_browser(&mut self, player_id: i32, browser_id: i32) {
         let mut server = self.server.lock().unwrap();
         server.destroy_browser(player_id, browser_id);
@@ -200,92 +117,50 @@ impl ServerCore {
     }
 
     pub fn poll_event(&mut self) -> Option<CoreEvent> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Some(event);
-        }
-
-        while let Ok(event) = self.event_rx.try_recv() {
+        // A producer or a stale-event flood must never hold the game tick here.
+        for _ in 0..EVENT_SCAN_BUDGET {
+            let Ok(event) = self.event_rx.try_recv() else { break; };
+            let server = self.server.lock().unwrap();
             match event {
-                ServerEvent::EmitEvent {
-                    player_id,
-                    event,
-                    arguments,
-                } => {
-                    self.pending_events.push_back(CoreEvent::EmitEvent {
-                        player_id,
-                        event,
-                        arguments,
-                    });
-                }
-
-                ServerEvent::PlayerConnected(player_id) => {
-                    trace!("poll_event::PlayerConnected({})", player_id);
-
-                    if self.await_connect.remove(&player_id).is_some() {
-                        self.pending_events.push_back(CoreEvent::PlayerInitialized {
-                            player_id,
-                            success: true,
-                        });
+                ServerEvent::EmitEvent { peer, player_id, game_generation, browser_id, browser_generation, event, arguments } => {
+                    if server.current_event(peer, player_id, game_generation, Some((browser_id, browser_generation))) && server.browser_accepts_events(player_id, browser_id, browser_generation) {
+                        return Some(CoreEvent::EmitEvent { player_id, browser_id, browser_generation, event, arguments });
                     }
                 }
-
-                ServerEvent::BrowserCreated {
-                    player_id,
-                    browser_id,
-                    code,
-                } => {
-                    self.pending_events.push_back(CoreEvent::BrowserCreated {
-                        player_id,
-                        browser_id,
-                        code,
-                    });
+                ServerEvent::PlayerConnected { peer, player_id, game_generation } => {
+                    if server.current_event(peer, player_id, game_generation, None) {
+                        self.await_connect.remove(&player_id);
+                        return Some(CoreEvent::PlayerInitialized { player_id, success: true });
+                    }
+                }
+                ServerEvent::BrowserCreated { peer, player_id, game_generation, browser_id, browser_generation, code } => {
+                    if server.current_event(peer, player_id, game_generation, Some((browser_id, browser_generation))) {
+                        return Some(CoreEvent::BrowserCreated { player_id, browser_id, browser_generation, code });
+                    }
                 }
             }
         }
-
-        self.notify_timeouts();
-        self.pending_events.pop_front()
-    }
-
-    fn notify_timeouts(&mut self) {
-        let mut keys = Vec::new();
-
-        let now = Instant::now();
-        for (&player_id, state) in self.await_connect.iter_mut() {
-            if state.notify_timeout(now) {
-                keys.push(player_id);
+        for (&player_id, (generation, start, notified)) in &mut self.await_connect {
+            if !*notified && start.elapsed() >= INIT_TIMEOUT {
+                *notified = true;
+                if self.server.lock().unwrap().game_generation(player_id) == Some(*generation) {
+                    return Some(CoreEvent::PlayerInitialized { player_id, success: false });
+                }
             }
         }
-
-        for player_id in keys {
-            self.pending_events.push_back(CoreEvent::PlayerInitialized {
-                player_id,
-                success: false,
-            });
-        }
+        None
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod poll_budget_tests {
     use super::*;
-
-    #[test]
-    fn timeout_is_reported_once_while_late_connection_remains_expected() {
-        let now = Instant::now();
-        let mut state = AwaitConnection::Pending(now - INIT_TIMEOUT);
-
-        assert!(state.notify_timeout(now));
-        assert!(matches!(state, AwaitConnection::TimedOut));
-        assert!(!state.notify_timeout(now + INIT_TIMEOUT));
-    }
-
-    #[test]
-    fn connection_does_not_time_out_early() {
-        let now = Instant::now();
-        let mut state = AwaitConnection::Pending(now);
-
-        assert!(!state.notify_timeout(now + INIT_TIMEOUT - Duration::from_millis(1)));
-        assert!(matches!(state, AwaitConnection::Pending(_)));
+    #[test] fn stale_events_are_consumed_in_bounded_batches() {
+        let (tx, rx) = crossbeam_channel::bounded(256);
+        let mut core = ServerCore { server: Arc::new(Mutex::new(Server::test_unbound())), event_rx: rx, await_connect: HashMap::new() };
+        for _ in 0..129 { tx.send(ServerEvent::PlayerConnected { peer: PeerId::default(), player_id: 7, game_generation: 1 }).unwrap(); }
+        assert!(core.poll_event().is_none());
+        assert_eq!(core.event_rx.len(), 1, "One tick must scan at most 128 stale events");
+        assert!(core.poll_event().is_none()); assert!(core.event_rx.is_empty());
     }
 }

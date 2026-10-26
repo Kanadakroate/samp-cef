@@ -11,3 +11,5 @@ tracing = "0.1.44"
 messages = { path = "../messages", package = "cef-messages" }
 network = { path = "../network", package = "cef-network" }
 quick-protobuf = "0.8.1"
+
+getrandom = "=0.2.17"

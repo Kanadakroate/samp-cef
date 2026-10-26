@@ -5,6 +5,7 @@ pub mod browser;
 pub mod client;
 pub mod command_line;
 pub mod handlers;
+pub mod local_policy;
 pub mod process_message;
 pub mod ref_counted;
 pub mod scheme;

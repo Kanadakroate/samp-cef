@@ -33,11 +33,22 @@ unsafe extern "system" fn on_load_end<I: LoadHandler>(
     obj.interface.on_load_end(browser, frame, status_code);
 }
 
+unsafe extern "system" fn on_load_error<I: LoadHandler>(
+    this: *mut cef_load_handler_t, browser: *mut cef_browser_t, frame: *mut cef_frame_t,
+    error_code: cef_sys::cef_errorcode_t::Type, _: *const cef_sys::cef_string_t,
+    _: *const cef_sys::cef_string_t,
+) {
+    if browser.is_null() || frame.is_null() { return; }
+    let obj: &mut Wrapper<_, I> = Wrapper::unwrap(this);
+    obj.interface.on_load_error(Browser::from_raw_add_ref(browser), Frame::from_raw_add_ref(frame), error_code);
+}
+
 pub fn wrap<T: LoadHandler>(load: T) -> *mut cef_load_handler_t {
     let mut object: cef_load_handler_t = unsafe { std::mem::zeroed() };
 
     object.on_loading_state_change = Some(on_loading_state_change::<T>);
     object.on_load_end = Some(on_load_end::<T>);
+    object.on_load_error = Some(on_load_error::<T>);
 
     let wrapper = Wrapper::new(object, load);
 
