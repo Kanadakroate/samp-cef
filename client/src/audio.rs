@@ -48,6 +48,7 @@ struct StreamFormat {
 type StereoFrame = (f32, f32);
 
 enum Command {
+    Notification { browser: u32, voice: crate::notification_sound::Voice },
     Stream {
         browser: u32,
         stream_id: i32,
@@ -123,6 +124,10 @@ impl Audio {
         if let Err(error) = self.command_tx.send(command) {
             tracing::error!(%error, "audio mixer is unavailable");
         }
+    }
+
+    pub fn play_notification(&self, browser: u32, voice: crate::notification_sound::Voice) -> bool {
+        self.command_tx.try_send(Command::Notification { browser, voice }).is_ok()
     }
 
     pub fn create_stream(
@@ -428,6 +433,7 @@ impl AudioStream {
 }
 
 struct Mixer {
+    notifications: HashMap<u32, crate::notification_sound::Voice>,
     output_rate: u32,
     gain: f32,
     paused: bool,
@@ -451,6 +457,7 @@ impl Mixer {
 
         Self {
             output_rate,
+            notifications: HashMap::new(),
             gain: 1.0,
             paused: false,
             streams: HashMap::new(),
@@ -460,6 +467,11 @@ impl Mixer {
 
     fn handle(&mut self, command: Command) -> bool {
         match command {
+            Command::Notification { browser, voice } => {
+                if let Some(previous) = self.notifications.insert(browser, voice) {
+                    previous.state.store(crate::notification_sound::CANCELLED, Ordering::Release);
+                }
+            }
             Command::Stream {
                 browser,
                 stream_id,
@@ -503,6 +515,9 @@ impl Mixer {
                 }
             }
             Command::RemoveAllStreams { browser } => {
+                if let Some(voice) = self.notifications.remove(&browser) {
+                    voice.state.store(crate::notification_sound::CANCELLED, Ordering::Release);
+                }
                 self.streams.remove(&browser);
             }
             Command::RemoveSource { browser, object_id } => {
@@ -568,6 +583,8 @@ impl Mixer {
         if self.paused {
             return output;
         }
+
+        self.notifications.retain(|_, voice| voice.render(self.output_rate, self.gain, &mut output));
 
         let mut mono = [0.0; MIX_FRAMES];
         let mut stereo = [(0.0, 0.0); MIX_FRAMES];
@@ -817,6 +834,29 @@ fn push_block(output: &ArrayQueue<f32>, block: [(f32, f32); MIX_FRAMES]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_obeys_mixer_pause_gain_and_teardown() {
+        use crate::notification_sound::*;
+        use std::sync::atomic::AtomicU8;
+        let clip = Arc::new(Clip { rate: 48000, frames: vec![(0.8,0.4); 600] });
+        let state = Arc::new(AtomicU8::new(QUEUED));
+        let mut mixer = Mixer::new(48000);
+        mixer.handle(Command::Notification { browser: 7, voice: Voice::new(clip, state.clone()) });
+        mixer.handle(Command::Gain(0.5));
+        mixer.set_paused(true);
+        for _ in 0..100 { assert!(mixer.render().iter().all(|s| *s==(0.,0.))); }
+        assert_eq!(state.load(Ordering::Acquire),QUEUED);
+        mixer.set_paused(false);
+        assert!(mixer.render().iter().all(|s| *s==(0.8*0.5*0.35,0.4*0.5*0.35)));
+        mixer.set_paused(true);
+        for _ in 0..100 { mixer.render(); }
+        mixer.set_paused(false);
+        assert!(mixer.render().iter().all(|s| *s==(0.8*0.5*0.35,0.4*0.5*0.35)));
+        mixer.handle(Command::RemoveAllStreams{browser:7});
+        assert_eq!(state.load(Ordering::Acquire),CANCELLED);
+        assert!(mixer.render().iter().all(|s| *s==(0.,0.)));
+    }
 
     #[test]
     fn attenuation_respects_reference_and_max_distance() {

@@ -26,6 +26,7 @@ use client_api::utils::handle_result;
 
 use crate::app::Event;
 use crate::audio::Audio;
+use crate::notification_sound::NotificationSession;
 use crate::browser::view::View;
 use crate::external::{CallbackList, EXTERNAL_BREAK};
 
@@ -88,6 +89,8 @@ fn rect_fits(rect: &cef_rect_t, width: usize, height: usize) -> bool {
 }
 
 pub struct WebClient {
+    notification: Mutex<NotificationSession>,
+    audio_muted: AtomicBool,
     id: u32, // static
     generation: u32, // immutable native lifetime, never accepted from JavaScript
     is_extern: bool,
@@ -129,6 +132,8 @@ impl LifespanHandler for WebClientRef {
     }
 
     fn on_before_close(&self, _: Browser) {
+        self.0.closing.store(true, Ordering::SeqCst);
+        self.0.notification.lock().reset();
         tracing::debug!(browser = self.0.id, "CEF browser instance is closing");
 
         let mut browser = self.0.browser.lock();
@@ -189,6 +194,31 @@ impl Client for WebClientRef {
         );
 
         match name.as_str() {
+            "lr_notification_sound" => {
+                if self.0.is_extern || self.0.generation == 0
+                    || !cef::local_policy::allows_notification_sound(&frame.url()) { return true; }
+                let args = msg.argument_list();
+                if args.len() != 2 || args.get_type(0) != ValueType::String || args.get_type(1) != ValueType::String { return true; }
+                let action = args.string(0).to_string();
+                let token = args.string(1).to_string();
+                if token.is_empty() || token.len() > 96 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':' || b == b'-') { return true; }
+                let url = frame.url();
+                let Some(bundle) = cef::local_policy::notification_bundle(&url) else { return true; };
+                let mut session = self.0.notification.lock();
+                if self.0.closing.load(Ordering::Acquire) { return true; }
+                let status = session.request(&action, &token, bundle, crate::utils::assets_dir(),
+                    !self.0.hidden.load(Ordering::Acquire) && !self.0.audio_muted.load(Ordering::Acquire),
+                    |voice| self.0.audio.play_notification(self.0.id, voice));
+                drop(session);
+                let reply = ProcessMessage::create("trigger_event");
+                let values = cef::types::list::List::new();
+                values.set_string(0, &cef::types::string::CefString::new(&token));
+                values.set_string(1, &cef::types::string::CefString::new(status));
+                reply.argument_list().set_string(0, &cef::types::string::CefString::new("lr:notification-sound"));
+                reply.argument_list().set_list(1, values);
+                frame.send_process_message(ProcessId::Renderer, reply);
+                return true;
+            }
             "set_focus" => {
                 let args = msg.argument_list();
                 let value_type = args.get_type(0);
@@ -384,6 +414,9 @@ impl RenderHandler for WebClientRef {
 }
 
 impl LoadHandler for WebClientRef {
+    fn on_loading_state_change(&self, _browser: Browser, loading: bool, _: bool, _: bool) {
+        if loading { self.0.notification.lock().reset(); }
+    }
     fn on_load_error(&self, _browser: Browser, frame: Frame, error_code: i32) {
         if frame.is_main() { self.0.notify_creation_error(error_code); }
     }
@@ -478,6 +511,8 @@ impl WebClient {
         view.make_display(rect[0], rect[1]);
 
         let client = WebClient {
+            notification: Mutex::default(),
+            audio_muted: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
             prev_hidden_flag: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -505,6 +540,8 @@ impl WebClient {
         let view = View::new();
 
         let client = WebClient {
+            notification: Mutex::default(),
+            audio_muted: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
             prev_hidden_flag: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -681,6 +718,8 @@ impl WebClient {
     }
 
     pub fn set_audio_muted(&self, muted: bool) {
+        self.audio_muted.store(muted, Ordering::Release);
+        if muted { self.notification.lock().cancel(); }
         if let Some(host) = self.browser().map(|br| br.host()) {
             host.set_audio_muted(muted);
         }
@@ -735,6 +774,7 @@ impl WebClient {
     }
 
     pub fn load_url(&self, url: &str) {
+        self.notification.lock().reset();
         if let Some(browser) = self.browser() {
             let url = crate::browser::assets_scheme::resolve_browser_url(url);
             browser.main_frame().load_url(&url);
@@ -768,6 +808,7 @@ impl WebClient {
 
     pub fn close(&self, force_close: bool) {
         self.closing.store(true, Ordering::SeqCst);
+        self.notification.lock().reset();
 
         if let Some(host) = self.browser().map(|br| br.host()) {
             host.close_browser(force_close)

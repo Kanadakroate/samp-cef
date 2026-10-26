@@ -38,6 +38,15 @@ impl V8Handler for Handler {
         let name = name.to_string();
 
         match name.as_str() {
+            "notification_sound" => {
+                if !cef::local_policy::allows_notification_sound(&self.frame.url()) || args.len() != 2 {
+                    return false;
+                }
+                let msg = ProcessMessage::create("lr_notification_sound");
+                convert_to_list(&args, &msg.argument_list());
+                self.frame.send_process_message(ProcessId::Browser, msg);
+                return true;
+            }
             "set_focus" => {
                 let msg = ProcessMessage::create("set_focus");
                 let list = msg.argument_list();
@@ -187,7 +196,11 @@ impl RenderProcessHandler for Application {
         let func_on = V8Value::new_function("on", Some(handler.clone()));
         let func_off = V8Value::new_function("off", Some(handler.clone()));
         let func_hide = V8Value::new_function("hide", Some(handler.clone()));
-        let func_emit = V8Value::new_function("emit", Some(handler));
+        let func_emit = V8Value::new_function("emit", Some(handler.clone()));
+        if cef::local_policy::allows_notification_sound(&handler.frame.url()) {
+            cef_obj.set_value_by_key(&CefString::new("notification_sound"),
+                &V8Value::new_function("notification_sound", Some(handler)));
+        }
 
         let key_str = CefString::new("version");
         let key_focus = CefString::new("set_focus");

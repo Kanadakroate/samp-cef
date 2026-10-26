@@ -21,6 +21,12 @@ client, renderer and server artifacts must come from compatible source pins.
 
 ## Audio work
 
+The new scoped native notification candidate and its exact validation boundary
+are documented in [native-notification-player.md](docs/liberty-revival/native-notification-player.md).
+It bypasses capture for the one local completion sound through the existing
+GTA-aware mixer; it does not patch the CEF engine. The following describes the
+imported baseline diagnosis, which remains relevant to other browser media.
+
 The achievement audio issue remains unresolved in this baseline. An isolated
 CEF 150 experiment reproduced missing initial samples when CEF's capture starts
 on demand. A pilot signal kept capture alive, but is a diagnostic experiment,
