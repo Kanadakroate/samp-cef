@@ -1,7 +1,7 @@
 # Fixed local UI audio candidate
 
-`cef.ui_audio(action, value)` is available only in the six shipped versioned LR
-main documents (house, garage, progression, toast, objective, diagnostic).
+`cef.ui_audio(action, value)` is available only in the seven shipped versioned LR
+main documents (house, garage, stats, progression, toast, objective, diagnostic).
 Browser-side origin, renderer source, main frame, external-browser and generation
 checks remain enforced. JS supplies no path or audio bytes.
 

@@ -27,7 +27,7 @@ pub fn ui_bundle(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next()?.strip_prefix("sampcef://assets/liberty-revival/")?;
     let (hash, page) = path.split_once('/')?;
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
-    matches!(page, "lr_house_ui/index.html" | "lr_garage_ui/index.html" | "lr_progression_ui/index.html"
+    matches!(page, "lr_house_ui/index.html" | "lr_garage_ui/index.html" | "lr_stats_ui/index.html" | "lr_progression_ui/index.html"
         | "lr_progression_toast/index.html" | "lr_objective_overlay/index.html" | "lr_cef_test/index.html").then_some(hash)
 }
 
@@ -37,7 +37,7 @@ mod ui_tests {
     #[test]
     fn ui_audio_is_exact_and_versioned() {
         let hash = "b".repeat(64);
-        for page in ["lr_house_ui", "lr_garage_ui", "lr_progression_ui", "lr_progression_toast", "lr_objective_overlay", "lr_cef_test"] {
+        for page in ["lr_house_ui", "lr_garage_ui", "lr_stats_ui", "lr_progression_ui", "lr_progression_toast", "lr_objective_overlay", "lr_cef_test"] {
             let url = format!("sampcef://assets/liberty-revival/{hash}/{page}/index.html");
             assert_eq!(ui_bundle(&url), Some(hash.as_str()));
             for denied in [url.replace("index.html", "other.html"), url.replace("assets/", "assets.evil/"),
