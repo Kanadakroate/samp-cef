@@ -2,6 +2,9 @@
 #[path = "../src/notification_sound.rs"]
 #[allow(dead_code)]
 mod notification_sound;
+#[path = "../src/ui_sound.rs"]
+#[allow(dead_code)]
+mod ui_sound;
 #[path = "../src/audio.rs"]
 #[allow(dead_code)]
 mod audio;

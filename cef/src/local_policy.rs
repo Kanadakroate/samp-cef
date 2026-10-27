@@ -21,6 +21,33 @@ pub fn notification_bundle(url: &str) -> Option<&str> {
     (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some(hash)
 }
 
+/// Only shipped LR main documents may use fixed-asset UI audio. No path from JS.
+pub fn ui_bundle(url: &str) -> Option<&str> {
+    if !allows_asset_url(url) { return None; }
+    let path = url.split(['?', '#']).next()?.strip_prefix("sampcef://assets/liberty-revival/")?;
+    let (hash, page) = path.split_once('/')?;
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+    matches!(page, "lr_house_ui/index.html" | "lr_garage_ui/index.html" | "lr_progression_ui/index.html"
+        | "lr_progression_toast/index.html" | "lr_objective_overlay/index.html" | "lr_cef_test/index.html").then_some(hash)
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    #[test]
+    fn ui_audio_is_exact_and_versioned() {
+        let hash = "b".repeat(64);
+        for page in ["lr_house_ui", "lr_garage_ui", "lr_progression_ui", "lr_progression_toast", "lr_objective_overlay", "lr_cef_test"] {
+            let url = format!("sampcef://assets/liberty-revival/{hash}/{page}/index.html");
+            assert_eq!(ui_bundle(&url), Some(hash.as_str()));
+            for denied in [url.replace("index.html", "other.html"), url.replace("assets/", "assets.evil/"),
+                url.replace(&hash, "../private"), url.replace(&hash, &hash.to_uppercase()), url.replace("sampcef:", "https:"), url.replace(page, "lr_unknown")] {
+                assert!(ui_bundle(&denied).is_none(), "{denied}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod notification_tests {
     use super::*;

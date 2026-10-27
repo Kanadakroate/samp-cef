@@ -49,6 +49,8 @@ type StereoFrame = (f32, f32);
 
 enum Command {
     Notification { browser: u32, voice: crate::notification_sound::Voice },
+    Click { browser: u32, voice: crate::notification_sound::Voice, created: std::time::Instant },
+    UiGain(f32),
     Stream {
         browser: u32,
         stream_id: i32,
@@ -95,6 +97,7 @@ pub struct Audio {
     pcm_seen: AtomicBool,
     paused: AtomicBool,
     gain_bits: AtomicU32,
+    ui_volume: AtomicU32,
 }
 
 impl Audio {
@@ -117,6 +120,7 @@ impl Audio {
             pcm_seen: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            ui_volume: AtomicU32::new(100),
         })
     }
 
@@ -128,6 +132,16 @@ impl Audio {
 
     pub fn play_notification(&self, browser: u32, voice: crate::notification_sound::Voice) -> bool {
         self.command_tx.try_send(Command::Notification { browser, voice }).is_ok()
+    }
+
+    pub fn play_ui_click(&self, browser: u32, voice: crate::notification_sound::Voice) -> bool {
+        if self.paused.load(Ordering::Acquire) || self.ui_volume.load(Ordering::Acquire) == 0 { return false; }
+        self.command_tx.try_send(Command::Click { browser, voice, created: std::time::Instant::now() }).is_ok()
+    }
+    pub fn set_ui_volume(&self, volume: u32) {
+        if volume <= 100 && self.ui_volume.swap(volume, Ordering::AcqRel) != volume {
+            self.send_control(Command::UiGain(volume as f32 / 100.));
+        }
     }
 
     pub fn create_stream(
@@ -434,6 +448,8 @@ impl AudioStream {
 
 struct Mixer {
     notifications: HashMap<u32, crate::notification_sound::Voice>,
+    clicks: HashMap<u32, crate::notification_sound::Voice>,
+    ui_gain: f32,
     output_rate: u32,
     gain: f32,
     paused: bool,
@@ -458,6 +474,8 @@ impl Mixer {
         Self {
             output_rate,
             notifications: HashMap::new(),
+            clicks: HashMap::new(),
+            ui_gain: 1.0,
             gain: 1.0,
             paused: false,
             streams: HashMap::new(),
@@ -472,6 +490,12 @@ impl Mixer {
                     previous.state.store(crate::notification_sound::CANCELLED, Ordering::Release);
                 }
             }
+            Command::Click { browser, voice, created } => {
+                if !self.paused && self.ui_gain > 0. && created.elapsed() < Duration::from_millis(200) {
+                    if let Some(old) = self.clicks.insert(browser, voice) { old.state.store(crate::notification_sound::CANCELLED, Ordering::Release); }
+                } else { voice.state.store(crate::notification_sound::CANCELLED, Ordering::Release); }
+            }
+            Command::UiGain(gain) => self.ui_gain = gain.clamp(0., 1.),
             Command::Stream {
                 browser,
                 stream_id,
@@ -518,6 +542,7 @@ impl Mixer {
                 if let Some(voice) = self.notifications.remove(&browser) {
                     voice.state.store(crate::notification_sound::CANCELLED, Ordering::Release);
                 }
+                if let Some(voice) = self.clicks.remove(&browser) { voice.state.store(crate::notification_sound::CANCELLED, Ordering::Release); }
                 self.streams.remove(&browser);
             }
             Command::RemoveSource { browser, object_id } => {
@@ -558,6 +583,7 @@ impl Mixer {
         tracing::debug!(paused, "browser audio pause state changed");
 
         if paused {
+            for (_, voice) in self.clicks.drain() { voice.state.store(crate::notification_sound::CANCELLED, Ordering::Release); }
             for streams in self.streams.values_mut() {
                 for stream in streams {
                     stream.input.clear();
@@ -584,7 +610,9 @@ impl Mixer {
             return output;
         }
 
-        self.notifications.retain(|_, voice| voice.render(self.output_rate, self.gain, &mut output));
+        self.notifications.retain(|_, voice| voice.render(self.output_rate, self.gain * self.ui_gain, &mut output));
+
+        self.clicks.retain(|_, voice| voice.render(self.output_rate, self.gain * self.ui_gain, &mut output));
 
         let mut mono = [0.0; MIX_FRAMES];
         let mut stereo = [(0.0, 0.0); MIX_FRAMES];
@@ -856,6 +884,29 @@ mod tests {
         mixer.handle(Command::RemoveAllStreams{browser:7});
         assert_eq!(state.load(Ordering::Acquire),CANCELLED);
         assert!(mixer.render().iter().all(|s| *s==(0.,0.)));
+    }
+
+    #[test]
+    fn ui_gain_scales_separate_click_and_toast_and_pause_drops_click() {
+        use crate::notification_sound::*;
+        let clip = Arc::new(Clip { rate:48000, frames:vec![(1.,1.);4096] });
+        let toast = Arc::new(std::sync::atomic::AtomicU8::new(QUEUED));
+        let click = Arc::new(std::sync::atomic::AtomicU8::new(QUEUED));
+        let mut mixer = Mixer::new(48000);
+        mixer.handle(Command::Notification { browser:1, voice:Voice::new(clip.clone(),toast.clone()) });
+        mixer.handle(Command::Click { browser:1, voice:Voice::new(clip.clone(),click.clone()), created:std::time::Instant::now() });
+        mixer.handle(Command::Gain(0.5)); mixer.handle(Command::UiGain(0.4));
+        assert!((mixer.render()[0].0 - 0.14).abs() < 0.00001);
+        assert_eq!(toast.load(Ordering::Acquire),PLAYING);
+        mixer.set_paused(true); assert_eq!(click.load(Ordering::Acquire),CANCELLED);
+        assert_eq!(mixer.render()[0],(0.,0.));
+        mixer.set_paused(false); assert!((mixer.render()[0].0-0.07).abs()<0.00001);
+        mixer.handle(Command::UiGain(0.)); assert_eq!(mixer.render()[0],(0.,0.));
+        let late = Arc::new(std::sync::atomic::AtomicU8::new(QUEUED));
+        mixer.handle(Command::Click { browser:2, voice:Voice::new(clip,late.clone()), created:std::time::Instant::now()-Duration::from_secs(1) });
+        assert_eq!(late.load(Ordering::Acquire),CANCELLED);
+        mixer.handle(Command::RemoveAllStreams{browser:1});
+        assert_eq!(toast.load(Ordering::Acquire),CANCELLED);
     }
 
     #[test]

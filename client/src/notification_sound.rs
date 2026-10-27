@@ -40,9 +40,10 @@ pub fn decode(bytes: Vec<u8>) -> Result<Arc<Clip>, String> {
     Ok(Arc::new(Clip { rate, frames }))
 }
 
-fn read_clip(root: &Path, bundle: &str) -> Result<Arc<Clip>, String> {
+fn read_clip(root: &Path, bundle: &str, click: bool) -> Result<Arc<Clip>, String> {
     let root = root.canonicalize().map_err(|_| "missing asset root")?;
-    let path = root.join("liberty-revival").join(bundle).join(ASSET).canonicalize().map_err(|_| "missing sound")?;
+    let asset = if click { "lr_shared/ui-click.ogg" } else { ASSET };
+    let path = root.join("liberty-revival").join(bundle).join(asset).canonicalize().map_err(|_| "missing sound")?;
     if !path.starts_with(&root) { return Err("sound outside asset root".into()); }
     let mut bytes = Vec::new();
     std::fs::File::open(path).map_err(|_| "sound open failed")?
@@ -57,11 +58,17 @@ pub struct Cache {
 }
 impl Cache {
     pub fn prepare(self: &Arc<Self>, root: std::path::PathBuf, bundle: String) {
+        self.prepare_fixed(root, bundle, false);
+    }
+    pub fn prepare_click(self: &Arc<Self>, root: std::path::PathBuf, bundle: String) {
+        self.prepare_fixed(root, bundle, true);
+    }
+    fn prepare_fixed(self: &Arc<Self>, root: std::path::PathBuf, bundle: String, click: bool) {
         if self.result.get().is_some() || self.loading.swap(true, Ordering::AcqRel) { return; }
         let cache = self.clone();
         if std::thread::Builder::new().name("lr-notification-decode".into()).spawn(move || {
             // Isolate malformed decoder input from the game process's worker lifecycle.
-            let result = std::panic::catch_unwind(|| read_clip(&root, &bundle))
+            let result = std::panic::catch_unwind(|| read_clip(&root, &bundle, click))
                 .unwrap_or_else(|_| Err("sound decoder failed".into()));
             let _ = cache.result.set(result);
         }).is_err() { let _ = self.result.set(Err("sound worker unavailable".into())); }

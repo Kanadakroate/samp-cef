@@ -38,6 +38,12 @@ impl V8Handler for Handler {
         let name = name.to_string();
 
         match name.as_str() {
+            "ui_audio" => {
+                if cef::local_policy::ui_bundle(&self.frame.url()).is_none() || args.len() != 2 { return false; }
+                let msg = ProcessMessage::create("lr_ui_audio");
+                convert_to_list(&args, &msg.argument_list());
+                self.frame.send_process_message(ProcessId::Browser, msg); return true;
+            }
             "notification_sound" => {
                 if !cef::local_policy::allows_notification_sound(&self.frame.url()) || args.len() != 2 {
                     return false;
@@ -197,6 +203,9 @@ impl RenderProcessHandler for Application {
         let func_off = V8Value::new_function("off", Some(handler.clone()));
         let func_hide = V8Value::new_function("hide", Some(handler.clone()));
         let func_emit = V8Value::new_function("emit", Some(handler.clone()));
+        if cef::local_policy::ui_bundle(&handler.frame.url()).is_some() {
+            cef_obj.set_value_by_key(&CefString::new("ui_audio"), &V8Value::new_function("ui_audio", Some(handler.clone())));
+        }
         if cef::local_policy::allows_notification_sound(&handler.frame.url()) {
             cef_obj.set_value_by_key(&CefString::new("notification_sound"),
                 &V8Value::new_function("notification_sound", Some(handler)));

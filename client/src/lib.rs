@@ -16,6 +16,7 @@ use winapi::um::winnt::DLL_PROCESS_ATTACH;
 pub mod app;
 pub mod audio;
 mod notification_sound;
+mod ui_sound;
 pub mod browser;
 
 #[cfg(feature = "crash_logger")]
